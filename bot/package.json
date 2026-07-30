@@ -1,0 +1,13 @@
+{
+  "name": "raffle-bot",
+  "version": "1.0.0",
+  "private": true,
+  "main": "garapan-bot.js",
+  "scripts": {
+    "start": "node garapan-bot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.27.0",
+    "dotenv": "^16.4.5"
+  }
+}

@@ -1,0 +1,9 @@
+node_modules
+.next
+.env
+.env.local
+.env*.local
+bot/.env
+bot/node_modules
+.vercel
+*.log
