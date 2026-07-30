@@ -28,25 +28,55 @@ export default function Navbar({ session }) {
         </span>
       </div>
 
-      {/* nav row */}
+      {/* nav row + toolbar, disatuin dalam 1 baris */}
       <div style={{
         display: "flex",
         alignItems: "center",
         justifyContent: "space-between",
+        gap: 12,
         padding: "10px 20px",
+        flexWrap: "wrap",
       }}>
-        <Link href="/" style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <img
-            src="/logo.jpg"
-            alt="House of Kizuna"
-            style={{ width: 22, height: 22, borderRadius: 5, display: "block" }}
-          />
-          <span style={{ fontSize: 14, fontWeight: 700, letterSpacing: 1, color: "var(--text)" }}>
-            HOUSE OF <span style={{ color: "var(--indigo-hi)" }}>KIZUNA</span>
-          </span>
-        </Link>
+        <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+          <Link href="/" style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+            <img
+              src="/logo.jpg"
+              alt="House of Kizuna"
+              style={{ width: 20, height: 20, borderRadius: 5, display: "block" }}
+            />
+            <span style={{ fontSize: 13, fontWeight: 700, letterSpacing: 1, color: "var(--text)", whiteSpace: "nowrap" }}>
+              HOUSE OF <span style={{ color: "var(--indigo-hi)" }}>KIZUNA</span>
+            </span>
+          </Link>
 
-        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 4, overflowX: "auto" }}>
+            {[
+              { href: "/", label: "OVERVIEW" },
+              { href: "/aco", label: "ACO" },
+              { href: "/inscription", label: "INSCRIPTION" },
+              { href: "/collab-request", label: "REQUEST COLLAB" },
+            ].map((item) => (
+              <Link
+                key={item.href}
+                href={item.href}
+                style={{
+                  fontSize: 10.5,
+                  letterSpacing: 1,
+                  color: "var(--text-dim)",
+                  border: "1px solid var(--border)",
+                  borderRadius: 4,
+                  padding: "4px 9px",
+                  whiteSpace: "nowrap",
+                  transition: "color 0.15s, border-color 0.15s",
+                }}
+              >
+                {item.label}
+              </Link>
+            ))}
+          </div>
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 12, flexShrink: 0 }}>
           {session?.isAdmin && (
             <Link href="/admin" style={{
               fontSize: 12,
@@ -67,39 +97,6 @@ export default function Navbar({ session }) {
           )}
           <SignOutButton />
         </div>
-      </div>
-
-      {/* toolbar row */}
-      <div style={{
-        display: "flex",
-        alignItems: "center",
-        gap: 4,
-        padding: "0 20px 10px",
-        overflowX: "auto",
-      }}>
-        {[
-          { href: "/", label: "GARAPAN" },
-          { href: "/aco", label: "ACO" },
-          { href: "/inscription", label: "INSCRIPTION" },
-          { href: "/collab-request", label: "REQUEST COLLAB" },
-        ].map((item) => (
-          <Link
-            key={item.href}
-            href={item.href}
-            style={{
-              fontSize: 11,
-              letterSpacing: 1,
-              color: "var(--text-dim)",
-              border: "1px solid var(--border)",
-              borderRadius: 4,
-              padding: "5px 10px",
-              whiteSpace: "nowrap",
-              transition: "color 0.15s, border-color 0.15s",
-            }}
-          >
-            {item.label}
-          </Link>
-        ))}
       </div>
     </header>
   );

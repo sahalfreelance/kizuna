@@ -98,3 +98,12 @@ input, select, textarea { font-family: var(--font-mono); }
 .card-anim {
   animation: fadeUp 0.25s ease forwards;
 }
+
+/* loading screen: pulsing logo + spinning ring */
+@keyframes logo-pulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50%       { transform: scale(1.08); opacity: 0.8; }
+}
+@keyframes ring-spin {
+  to { transform: rotate(360deg); }
+}

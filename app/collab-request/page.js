@@ -17,12 +17,25 @@ export default function CollabRequestPage() {
       }}
     >
       <div style={{ maxWidth: 560, width: "100%" }}>
-        <Link href="/" style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 28, width: "fit-content" }}>
-          <img src="/logo.jpg" alt="House of Kizuna" style={{ width: 22, height: 22, borderRadius: 5 }} />
-          <span style={{ fontSize: 14, fontWeight: 700, letterSpacing: 1, color: "var(--text)" }}>
-            HOUSE OF <span style={{ color: "var(--indigo-hi)" }}>KIZUNA</span>
-          </span>
-        </Link>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 28, flexWrap: "wrap", gap: 12 }}>
+          <Link href="/" style={{ display: "flex", alignItems: "center", gap: 8, width: "fit-content" }}>
+            <img src="/logo.jpg" alt="House of Kizuna" style={{ width: 22, height: 22, borderRadius: 5 }} />
+            <span style={{ fontSize: 14, fontWeight: 700, letterSpacing: 1, color: "var(--text)" }}>
+              HOUSE OF <span style={{ color: "var(--indigo-hi)" }}>KIZUNA</span>
+            </span>
+          </Link>
+
+          <Link href="/" style={{
+            fontSize: 12,
+            color: "var(--text-dim)",
+            border: "1px solid var(--border)",
+            borderRadius: 6,
+            padding: "6px 12px",
+            letterSpacing: 0.5,
+          }}>
+            ← Kembali ke beranda
+          </Link>
+        </div>
 
         <div
           style={{
