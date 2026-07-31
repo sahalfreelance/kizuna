@@ -60,24 +60,60 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Pesan yang di-FORWARD embed-nya udah nempel dari awal (snapshot dari
+// pesan asli), langsung lengkap. Tapi pesan yang DIKETIK MANUAL sama
+// member, link-nya baru di-unfurl Discord belakangan -- dan itu bisa makan
+// waktu lebih dari beberapa detik, gak nentu. Jadi kita gak nunggu tetap
+// (fixed delay), tapi terus ngecek ulang sampai embed-nya nempel ATAU
+// waktu tunggu maksimum abis (biar gak nunggu selamanya kalau emang gak
+// bakal ada embed, misal link-nya rusak/gak ke-unfurl).
+function countEmbeds(msg) {
+  const snapshotEmbeds = msg.messageSnapshots
+    ? [...msg.messageSnapshots.values()].flatMap((s) => s.embeds || [])
+    : [];
+  return (msg.embeds?.length || 0) + snapshotEmbeds.length;
+}
+
+function getTextContent(msg) {
+  const snapshots = msg.messageSnapshots ? [...msg.messageSnapshots.values()] : [];
+  return msg.content || snapshots.map((s) => s.content).filter(Boolean).join("\n");
+}
+
+async function waitForEmbeds(message, { maxWaitMs = 10000, intervalMs = 2000 } = {}) {
+  const hasUrl = /https?:\/\//.test(getTextContent(message) || "");
+  let current = message;
+  const startedAt = Date.now();
+
+  // Tunggu awal dikit dulu (embed jarang langsung nempel di milidetik pertama)
+  await sleep(1500);
+  try {
+    current = await current.fetch();
+  } catch {
+    return current;
+  }
+
+  // Pesan yang di-FORWARD embed-nya ada di messageSnapshots (bukan
+  // message.embeds), jadi udah lengkap dari awal -> gak perlu nunggu.
+  // Yang perlu ditunggu cuma pesan biasa yang linknya belum sempet di-unfurl.
+  while (hasUrl && countEmbeds(current) === 0 && Date.now() - startedAt < maxWaitMs) {
+    await sleep(intervalMs);
+    try {
+      current = await current.fetch();
+    } catch {
+      break; // pesan kehapus / gak bisa di-fetch ulang -> stop, pakai versi terakhir
+    }
+  }
+
+  return current;
+}
+
 client.on(Events.MessageCreate, async (message) => {
   try {
     const category = CHANNEL_CATEGORY_MAP[message.channel.id];
     if (!category) return; // channel ini gak dipantau
     if (message.author.id === client.user.id) return; // hindari loop kalau bot ini sendiri yang ngirim
 
-    // Discord suka nempelin link-preview/embed BEBERAPA DETIK setelah pesan
-    // pertama kali muncul (proses unfurl link-nya async, bukan bagian dari
-    // event message pertama). Kalau langsung diproses saat itu juga, embed-nya
-    // sering belum nempel -> hasilnya jadi gak lengkap. Jadi kita tunggu dulu,
-    // terus fetch ulang pesannya biar dapet versi yang udah lengkap embed-nya.
-    await sleep(3000);
-    let freshMessage = message;
-    try {
-      freshMessage = await message.fetch();
-    } catch {
-      // pesan mungkin kehapus / gak bisa di-fetch ulang -> pakai versi awal aja
-    }
+    const freshMessage = await waitForEmbeds(message);
 
     const payload = category === "MINT"
       ? buildMintPayload(freshMessage)
@@ -282,6 +318,26 @@ function buildPayload(message, category) {
     title = rawTitle;
     description = rawBody;
     link = message.url;
+
+    // Kalau baris pertama pesannya ternyata cuma link mentah (bukan teks
+    // deskriptif), itu jelek banget kalau jadi judul card. Dalam kasus ini,
+    // coba ambil judul dari link-preview MANAPUN (bukan cuma rich) yang
+    // punya title+description sekaligus -- biasanya itu OG card resmi dari
+    // project-nya sendiri (misal "PepeMaxiBiz — Mint"). Ini CUMA dipakai
+    // kalau judul awalnya emang link mentah, biar gak nimpa kasus yang judul
+    // aslinya udah teks bagus (misal "Orbinum Airdrop").
+    const isBareLinkTitle = /^https?:\/\/\S+$/.test(rawTitle || "");
+    if (isBareLinkTitle) {
+      const curated = embeds.find(
+        (e) => embedType(e) !== "rich" && !isTwitterEmbed(e) && e.title && e.description
+      );
+      if (curated) {
+        title = curated.title;
+        description = [serializeEmbed(curated), rawBody].filter(Boolean).join("\n\n");
+        link = curated.url || link;
+      }
+    }
+
     if (twitterDetail) {
       // Isi tweet-nya (kadang berharga banget, kayak watchlist project)
       // digabungin ke deskripsi, dan tombol link diarahin ke tweet aslinya
