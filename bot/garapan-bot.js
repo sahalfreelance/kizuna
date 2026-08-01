@@ -41,6 +41,10 @@ if (Object.keys(CHANNEL_CATEGORY_MAP).length === 0) {
   process.exit(1);
 }
 
+// Naikin angka ini tiap kali update kode, biar gampang ngecek di log
+// versi mana yang beneran lagi jalan (pm2 logs garapan-bot).
+const BOT_VERSION = "v19";
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -50,7 +54,7 @@ const client = new Client({
 });
 
 client.once(Events.ClientReady, (c) => {
-  console.log(`Bot aktif sebagai ${c.user.tag}. Channel yang dipantau:`);
+  console.log(`Bot aktif sebagai ${c.user.tag} [${BOT_VERSION}]. Channel yang dipantau:`);
   for (const [channelId, category] of Object.entries(CHANNEL_CATEGORY_MAP)) {
     console.log(`  - ${channelId} -> ${category}`);
   }
@@ -107,17 +111,100 @@ async function waitForEmbeds(message, { maxWaitMs = 10000, intervalMs = 2000 } =
   return current;
 }
 
+// GIF (dari Tenor/Giphy/GIF picker Discord) gak dianggep "link beneran" --
+// orang reply pake GIF doang itu candaan, bukan info garapan.
+function isGifUrl(url) {
+  return /\.gif(?:[?#]|$)/i.test(url) || /(?:tenor\.com|giphy\.com)/i.test(url);
+}
+
+// Kalau Discord gagal/lambat nge-unfurl suatu link (gak ada embed sama
+// sekali buat link itu), bot fetch sendiri halamannya dan ambil meta
+// og:title/og:description/og:image-nya secara manual.
+async function fetchOgTags(url, timeoutMs = 4500) {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; KizunaBot/1.0; +https://kizunafnf.vercel.app)" },
+    });
+    clearTimeout(timer);
+    if (!res.ok) return null;
+
+    const html = await res.text();
+    const getMeta = (prop) => {
+      const patterns = [
+        new RegExp(`<meta[^>]+property=["']${prop}["'][^>]+content=["']([^"']*)["']`, "i"),
+        new RegExp(`<meta[^>]+content=["']([^"']*)["'][^>]+property=["']${prop}["']`, "i"),
+        new RegExp(`<meta[^>]+name=["']${prop}["'][^>]+content=["']([^"']*)["']`, "i"),
+      ];
+      for (const re of patterns) {
+        const m = html.match(re);
+        if (m) return m[1];
+      }
+      return null;
+    };
+    const titleTag = html.match(/<title[^>]*>([^<]*)<\/title>/i);
+
+    const title = getMeta("og:title") || (titleTag ? titleTag[1].trim() : null);
+    if (!title) return null; // gak dapet apa-apa yang berguna
+
+    return {
+      title,
+      description: getMeta("og:description") || null,
+      image: getMeta("og:image") || null,
+    };
+  } catch {
+    return null; // timeout / gagal fetch / bukan HTML -> diem-diem aja, ada fallback lain
+  }
+}
+
+// Pesan WAJIB ngandung link asli (bukan GIF doang) buat dianggep garapan.
+// Ini nyaring obrolan santai kayak "scan qris", "ane gak diajak" dll yang
+// numpang lewat di channel yang sama tapi bukan info garapan beneran.
+function hasMeaningfulLink(message) {
+  const snapshots = message.messageSnapshots
+    ? [...message.messageSnapshots.values()]
+    : [];
+  const embeds = [
+    ...(message.embeds || []),
+    ...snapshots.flatMap((s) => s.embeds || []),
+  ];
+  const rawContent = (
+    message.content || snapshots.map((s) => s.content).filter(Boolean).join("\n")
+  );
+
+  const embedTextParts = embeds.flatMap((e) => [
+    e.title, e.description, e.url,
+    ...(e.fields || []).map((f) => f.value),
+  ]).filter(Boolean);
+  const combined = [rawContent, ...embedTextParts].join("\n");
+
+  const urls = combined.match(/https?:\/\/[^\s<>()]+/g) || [];
+  return urls.some((u) => !isGifUrl(u));
+}
+
 client.on(Events.MessageCreate, async (message) => {
   try {
     const category = CHANNEL_CATEGORY_MAP[message.channel.id];
     if (!category) return; // channel ini gak dipantau
     if (message.author.id === client.user.id) return; // hindari loop kalau bot ini sendiri yang ngirim
 
-    const freshMessage = await waitForEmbeds(message);
+    // Pesan yang di-FORWARD datanya (embed, teks, gambar) udah lengkap dari
+    // awal lewat messageSnapshots -- gak perlu nunggu ATAU di-fetch ulang.
+    // Refetch (buat kasus link yang belum ke-unfurl) itu KHUSUS buat pesan
+    // biasa; kalau dipaksain ke pesan forward malah beresiko kehilangan
+    // data snapshot-nya (kadang API gak selalu ngirim snapshot lengkap lagi
+    // pas di-fetch ulang) -- itu penyebab hasil forward yang sama bisa beda
+    // isinya tiap kali diproses.
+    const isForwarded = message.messageSnapshots?.size > 0;
+    const freshMessage = isForwarded ? message : await waitForEmbeds(message);
+
+    if (!hasMeaningfulLink(freshMessage)) return; // gak ada link beneran (chit-chat / cuma GIF) -> skip
 
     const payload = category === "MINT"
       ? buildMintPayload(freshMessage)
-      : buildPayload(freshMessage, category);
+      : await buildPayload(freshMessage, category);
     if (!payload.title) return; // pesan kosong / cuma emoji, skip
 
     const res = await fetch(`${WEBSITE_URL}/api/webhook/garapan`, {
@@ -228,7 +315,12 @@ function detectRaffleExpiry(embeds) {
   return { status: null, expiresAt: null }; // gak ketemu info waktu -> biar default (LIVE)
 }
 
-function buildPayload(message, category) {
+function firstMeaningfulLine(lines) {
+  const line = lines.find((l) => l.trim() && !/^https?:\/\/\S+$/.test(l.trim()));
+  return line ? line.trim().slice(0, 100) : null;
+}
+
+async function buildPayload(message, category) {
   // Kalau pesannya di-FORWARD (fitur Forward Discord), konten aslinya
   // (embed, teks, gambar) ada di message.messageSnapshots, BUKAN di
   // message.embeds / message.content langsung (itu bakal kosong).
@@ -320,12 +412,14 @@ function buildPayload(message, category) {
     link = message.url;
 
     // Kalau baris pertama pesannya ternyata cuma link mentah (bukan teks
-    // deskriptif), itu jelek banget kalau jadi judul card. Dalam kasus ini,
-    // coba ambil judul dari link-preview MANAPUN (bukan cuma rich) yang
-    // punya title+description sekaligus -- biasanya itu OG card resmi dari
-    // project-nya sendiri (misal "PepeMaxiBiz — Mint"). Ini CUMA dipakai
-    // kalau judul awalnya emang link mentah, biar gak nimpa kasus yang judul
-    // aslinya udah teks bagus (misal "Orbinum Airdrop").
+    // deskriptif), itu jelek banget kalau jadi judul card. Judul GAK BOLEH
+    // berupa URL -- coba beberapa sumber berurutan sampai ketemu yang bagus:
+    // 1) link-preview Discord yang punya title+description (misal OG card
+    //    resmi project-nya, "PepeMaxiBiz — Mint")
+    // 2) kalau Discord gak nyediain itu (gagal/lambat unfurl) -> bot fetch
+    //    sendiri halamannya, ambil og:title manual
+    // 3) kalau itu juga gagal -> pakai baris teks pertama yang BUKAN link
+    // 4) last resort -> nama domainnya aja, tetep bukan URL utuh
     const isBareLinkTitle = /^https?:\/\/\S+$/.test(rawTitle || "");
     if (isBareLinkTitle) {
       const curated = embeds.find(
@@ -335,6 +429,24 @@ function buildPayload(message, category) {
         title = curated.title;
         description = [serializeEmbed(curated), rawBody].filter(Boolean).join("\n\n");
         link = curated.url || link;
+      } else {
+        const urls = rawContent.match(/https?:\/\/[^\s<>()]+/g) || [];
+        const primaryUrl = urls.find((u) => !isGifUrl(u));
+        const og = primaryUrl ? await fetchOgTags(primaryUrl) : null;
+
+        if (og?.title) {
+          title = og.title;
+          description = [og.description, rawBody].filter(Boolean).join("\n\n");
+          link = primaryUrl;
+          if (!imageUrl && og.image) imageUrl = og.image;
+        } else {
+          const fallbackTitle = firstMeaningfulLine(rawLines);
+          if (fallbackTitle) {
+            title = fallbackTitle;
+          } else if (primaryUrl) {
+            try { title = new URL(primaryUrl).hostname.replace("www.", ""); } catch { /* biarin, fallback "Garapan baru" di return */ }
+          }
+        }
       }
     }
 
