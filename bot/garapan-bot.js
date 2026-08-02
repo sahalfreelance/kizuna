@@ -43,7 +43,7 @@ if (Object.keys(CHANNEL_CATEGORY_MAP).length === 0) {
 
 // Naikin angka ini tiap kali update kode, biar gampang ngecek di log
 // versi mana yang beneran lagi jalan (pm2 logs garapan-bot).
-const BOT_VERSION = "v19";
+const BOT_VERSION = "v20";
 
 const client = new Client({
   intents: [
@@ -346,10 +346,22 @@ async function buildPayload(message, category) {
   // TAPI khusus link Twitter/X, preview-nya justru isinya beneran isi tweet
   // (teks lengkap + gambar) yang emang berharga -> itu dikecualiin, tetep
   // dianggep "informatif" sama kayak embed asli dari bot.
-  const embedType = (e) => e?.data?.type || e?.type || "rich";
+  // Bedain embed ASLI dari bot (rich, sengaja dibikin) vs LINK-PREVIEW
+  // otomatis (hasil unfurl URL sama Discord). Field `type` kadang gak
+  // ke-expose konsisten sama discord.js, jadi itu gak bisa diandelin
+  // sendirian. Sinyal yang lebih pasti: link-preview otomatis SELALU punya
+  // field `provider` (misal {name: "X (formerly Twitter)"}), sementara embed
+  // yang sengaja dibikin bot GAK PERNAH punya provider (itu murni buatan
+  // Discord buat nunjukkin embed-nya berasal dari unfurl URL, bukan dari bot).
   const isTwitterEmbed = (e) => /(?:twitter\.com|x\.com)\//i.test(e?.url || "");
-  const richEmbeds = embeds.filter((e) => embedType(e) === "rich");
-  const informativeEmbeds = [...richEmbeds, ...embeds.filter((e) => embedType(e) !== "rich" && isTwitterEmbed(e))]
+  const isLinkPreview = (e) => {
+    const type = e?.data?.type || e?.type;
+    if (type && type !== "rich") return true; // eksplisit ketauan bukan rich
+    const provider = e?.data?.provider || e?.provider;
+    return Boolean(provider);
+  };
+  const richEmbeds = embeds.filter((e) => !isLinkPreview(e));
+  const informativeEmbeds = [...richEmbeds, ...embeds.filter((e) => isLinkPreview(e) && isTwitterEmbed(e))]
     .sort((a, b) => embedScore(b) - embedScore(a)); // paling detail duluan
 
   // Cari gambar: utamain dari embed yang informatif dulu, baru fallback ke
@@ -382,7 +394,7 @@ async function buildPayload(message, category) {
   // Twitter/X card TIDAK boleh nimpa judul (isinya nama akun, bukan judul
   // yang berguna) -> cuma dipakai buat NAMBAHIN isi deskripsi.
   const twitterDetail = embeds.find(
-    (e) => embedType(e) !== "rich" && isTwitterEmbed(e) && (e.title || e.description)
+    (e) => isLinkPreview(e) && isTwitterEmbed(e) && (e.title || e.description)
   );
   const rawLines = rawContent ? rawContent.split("\n") : [];
   const rawTitle = rawLines[0]?.slice(0, 100);
@@ -423,7 +435,7 @@ async function buildPayload(message, category) {
     const isBareLinkTitle = /^https?:\/\/\S+$/.test(rawTitle || "");
     if (isBareLinkTitle) {
       const curated = embeds.find(
-        (e) => embedType(e) !== "rich" && !isTwitterEmbed(e) && e.title && e.description
+        (e) => isLinkPreview(e) && !isTwitterEmbed(e) && e.title && e.description
       );
       if (curated) {
         title = curated.title;
