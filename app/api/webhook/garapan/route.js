@@ -28,6 +28,26 @@ export async function POST(req) {
       ? (["LIVE", "PAST"].includes(status) ? status : "LIVE")
       : null;
 
+  // Jaring pengaman anti-duplikat: kalau ada entry dengan link+category yang
+  // SAMA PERSIS baru aja dibikin beberapa menit lalu, anggep itu request
+  // dobel (misal ada 2 proses bot yang kebetulan nyala bareng abis redeploy)
+  // dan JANGAN insert lagi -- balikin entry yang udah ada aja.
+  if (link) {
+    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    const { data: existing } = await supabaseAdmin
+      .from("garapan")
+      .select()
+      .eq("link", link)
+      .eq("category", category)
+      .gte("created_at", fiveMinutesAgo)
+      .limit(1)
+      .maybeSingle();
+
+    if (existing) {
+      return NextResponse.json({ data: existing, deduped: true });
+    }
+  }
+
   const { data, error } = await supabaseAdmin
     .from("garapan")
     .insert({

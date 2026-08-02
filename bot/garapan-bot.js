@@ -444,9 +444,21 @@ async function buildPayload(message, category) {
       } else {
         const urls = rawContent.match(/https?:\/\/[^\s<>()]+/g) || [];
         const primaryUrl = urls.find((u) => !isGifUrl(u));
-        const og = primaryUrl ? await fetchOgTags(primaryUrl) : null;
+        // Twitter/X SERING nolak/nge-block request dari bot (bukan browser
+        // beneran) -> hasil scrape og:title-nya gak bisa dipercaya. Kita udah
+        // punya data asli dari Discord sendiri (twitterDetail, dari card yang
+        // di-unfurl Discord), jadi GAK USAH scrape manual buat link
+        // twitter/x -- langsung lompat ke fallback teks caption orangnya.
+        const skipOgFetch = isTwitterEmbed({ url: primaryUrl });
+        const og = primaryUrl && !skipOgFetch ? await fetchOgTags(primaryUrl) : null;
+        // Judul HARUS BUKAN URL, titik. Jaga-jaga: apapun sumbernya (termasuk
+        // hasil scrape og:title), kalau isinya link mentah lagi, jangan
+        // dipake -- ini akar bug "judul masih pake url" yang kejadian pas
+        // fetchOgTags balikin sesuatu yang gak valid buat link yang
+        // di-block/di-redirect.
+        const isUrlLike = (s) => /^https?:\/\/\S+$/.test((s || "").trim());
 
-        if (og?.title) {
+        if (og?.title && !isUrlLike(og.title)) {
           title = og.title;
           description = [og.description, rawBody].filter(Boolean).join("\n\n");
           link = primaryUrl;
