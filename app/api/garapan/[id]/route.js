@@ -1,19 +1,18 @@
-import { getServerSession } from "next-auth";
 import { NextResponse } from "next/server";
-import { authOptions } from "@/lib/auth";
+import { getAuthContext } from "@/lib/apiAuth";
 import { supabaseAdmin } from "@/lib/supabase";
 
-const VALID_CATEGORIES = ["CRYPTO", "NFT", "RAFFLE", "MINT"];
+const VALID_CATEGORIES = ["CRYPTO", "NFT", "RAFFLE", "AIRDROP"];
 const VALID_STATUSES = ["LIVE", "PAST"];
 
 export async function PUT(req, { params }) {
-  const session = await getServerSession(authOptions);
-  if (!session?.isAdmin) {
+  const auth = await getAuthContext(req);
+  if (!auth?.isAdmin) {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
   const body = await req.json();
-  const { title, description, category, status, link, secondary_link, image_url } = body;
+  const { title, description, category, status, link, image_url } = body;
 
   if (!title || !VALID_CATEGORIES.includes(category)) {
     return NextResponse.json({ error: "Data tidak valid" }, { status: 400 });
@@ -33,7 +32,6 @@ export async function PUT(req, { params }) {
       category,
       status: category === "RAFFLE" ? status : null,
       link: link || null,
-      secondary_link: secondary_link || null,
       image_url: image_url || null,
       updated_at: new Date().toISOString(),
     })
@@ -47,9 +45,9 @@ export async function PUT(req, { params }) {
   return NextResponse.json({ data });
 }
 
-export async function DELETE(_req, { params }) {
-  const session = await getServerSession(authOptions);
-  if (!session?.isAdmin) {
+export async function DELETE(req, { params }) {
+  const auth = await getAuthContext(req);
+  if (!auth?.isAdmin) {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 

@@ -43,7 +43,7 @@ if (Object.keys(CHANNEL_CATEGORY_MAP).length === 0) {
 
 // Naikin angka ini tiap kali update kode, biar gampang ngecek di log
 // versi mana yang beneran lagi jalan (pm2 logs garapan-bot).
-const BOT_VERSION = "v20";
+const BOT_VERSION = "v22";
 
 const client = new Client({
   intents: [
@@ -156,6 +156,58 @@ async function fetchOgTags(url, timeoutMs = 4500) {
     };
   } catch {
     return null; // timeout / gagal fetch / bukan HTML -> diem-diem aja, ada fallback lain
+  }
+}
+
+// Cari URL twitter/x di dalam suatu teks (dipakai buat cari kandidat link
+// yang mau di-oEmbed kalau Discord sendiri belum sempet ngunfurl-nya).
+function findTwitterUrl(text) {
+  const urls = (text || "").match(/https?:\/\/[^\s<>()]+/g) || [];
+  return urls.find((u) => /(?:twitter\.com|x\.com)\//i.test(u)) || null;
+}
+
+// Kalau Discord BELUM sempet ngunfurl link X jadi embed (dalam batas waktu
+// waitForEmbeds), kita gak scrape halaman x.com sendiri (itu SERING gagal --
+// X ngeblock request non-browser / butuh render JS). Sebagai gantinya, pakai
+// oEmbed API RESMI dari X (publish.twitter.com/oembed) -- ini didesain buat
+// dipanggil bot/embed generator, gak butuh auth, dan balikin isi tweet asli
+// (author + teks) dalam bentuk HTML kecil yang tinggal di-strip tag-nya.
+async function fetchTwitterOEmbed(tweetUrl, timeoutMs = 4500) {
+  try {
+    const apiUrl = `https://publish.twitter.com/oembed?url=${encodeURIComponent(tweetUrl)}&omit_script=true`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const res = await fetch(apiUrl, { signal: controller.signal });
+    clearTimeout(timer);
+    if (!res.ok) return null; // termasuk tweet yang kehapus/private -> 404
+
+    const data = await res.json();
+    if (!data?.html) return null;
+
+    // data.html isinya kira-kira:
+    // <blockquote><p lang="..">ISI TWEET</p>&mdash; Nama (@handle) <a href="...">tanggal</a></blockquote>
+    // Ambil isi <p> pertama sebagai teks tweet-nya, buang sisa tag & decode entity dasar.
+    const pMatch = data.html.match(/<p[^>]*>([\s\S]*?)<\/p>/i);
+    const rawText = pMatch ? pMatch[1] : data.html;
+    const text = rawText
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<[^>]+>/g, "")
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .trim();
+    if (!text) return null;
+
+    return {
+      url: data.url || tweetUrl,
+      title: text.split("\n")[0].slice(0, 100),
+      description: data.author_name ? `${text}\n\n— ${data.author_name}` : text,
+    };
+  } catch (err) {
+    console.log(`[debug] fetchTwitterOEmbed error: ${err.message}`);
+    return null; // timeout / tweet kehapus / rate-limited -> diem-diem aja, fallback lain masih jalan
   }
 }
 
@@ -360,8 +412,9 @@ async function buildPayload(message, category) {
     const provider = e?.data?.provider || e?.provider;
     return Boolean(provider);
   };
-  const richEmbeds = embeds.filter((e) => !isLinkPreview(e));
-  const informativeEmbeds = [...richEmbeds, ...embeds.filter((e) => isLinkPreview(e) && isTwitterEmbed(e))]
+  const richEmbeds = embeds.filter((e) => !isLinkPreview(e) && !isTwitterEmbed(e));
+  const twitterEmbeds = embeds.filter((e) => isTwitterEmbed(e));
+  const informativeEmbeds = [...richEmbeds, ...twitterEmbeds]
     .sort((a, b) => embedScore(b) - embedScore(a)); // paling detail duluan
 
   // Cari gambar: utamain dari embed yang informatif dulu, baru fallback ke
@@ -393,11 +446,33 @@ async function buildPayload(message, category) {
   const richDetail = richEmbeds.find((e) => e.fields?.length || e.description);
   // Twitter/X card TIDAK boleh nimpa judul (isinya nama akun, bukan judul
   // yang berguna) -> cuma dipakai buat NAMBAHIN isi deskripsi.
-  const twitterDetail = embeds.find(
-    (e) => isLinkPreview(e) && isTwitterEmbed(e) && (e.title || e.description)
+  let twitterDetail = embeds.find(
+    (e) => isTwitterEmbed(e) && (e.title || e.description)
   );
+  // Discord belum sempet ngunfurl link X-nya (masih sering kejadian, X lambat
+  // banget kadang) -> twitterDetail di atas bakal kosong. Daripada ujung-
+  // ujungnya title jatuh ke nama domain doang ("x.com"), coba tarik isi
+  // tweet-nya lewat oEmbed API resmi X dulu.
+  if (!twitterDetail) {
+    const combinedForTwitterSearch = [
+      rawContent,
+      ...embeds.flatMap((e) => [e.title, e.description, e.url]),
+    ].filter(Boolean).join("\n");
+    const twitterUrl = findTwitterUrl(combinedForTwitterSearch);
+    if (twitterUrl) {
+      const oembed = await fetchTwitterOEmbed(twitterUrl);
+      if (oembed) {
+        twitterDetail = oembed;
+        console.log(`[debug] twitterDetail dari oEmbed: title="${oembed.title}"`);
+      } else {
+        console.log(`[debug] oEmbed gagal/kosong buat ${twitterUrl}`);
+      }
+    }
+  } else {
+    console.log(`[debug] twitterDetail dari Discord embed (bukan oEmbed): title="${twitterDetail.title}" desc_len=${(twitterDetail.description || "").length}`);
+  }
   const rawLines = rawContent ? rawContent.split("\n") : [];
-  const rawTitle = rawLines[0]?.slice(0, 100);
+  const rawTitle = rawLines[0]?.trim().slice(0, 100);
   const rawBody = rawLines.slice(1).join("\n");
 
   if (richDetail) {
@@ -463,12 +538,29 @@ async function buildPayload(message, category) {
           description = [og.description, rawBody].filter(Boolean).join("\n\n");
           link = primaryUrl;
           if (!imageUrl && og.image) imageUrl = og.image;
+          console.log(`[debug] title dari og:title manual: "${title}"`);
         } else {
           const fallbackTitle = firstMeaningfulLine(rawLines);
           if (fallbackTitle) {
             title = fallbackTitle;
+            console.log(`[debug] title dari firstMeaningfulLine(rawLines): "${title}"`);
+          } else if (twitterDetail && (twitterDetail.description || twitterDetail.title)) {
+            // Gak ada caption dari orangnya sama sekali (pesan cuma link
+            // doang) -> daripada jatuh ke nama domain ("x.com") yang gak
+            // informatif, pakai baris pertama ISI TWEET-nya sendiri (udah
+            // ke-unfurl Discord jadi twitterDetail) sebagai judul.
+            const tweetLines = (twitterDetail.description || twitterDetail.title || "").split("\n");
+            const tweetFirstLine = firstMeaningfulLine(tweetLines);
+            if (tweetFirstLine) {
+              title = tweetFirstLine;
+              console.log(`[debug] title dari twitterDetail (baris pertama tweet): "${title}"`);
+            } else if (primaryUrl) {
+              try { title = new URL(primaryUrl).hostname.replace("www.", ""); } catch { /* biarin */ }
+              console.log(`[debug] title jatuh ke hostname (twitterDetail ada tapi firstMeaningfulLine gagal): "${title}"`);
+            }
           } else if (primaryUrl) {
             try { title = new URL(primaryUrl).hostname.replace("www.", ""); } catch { /* biarin, fallback "Garapan baru" di return */ }
+            console.log(`[debug] title jatuh ke hostname (twitterDetail kosong): "${title}"`);
           }
         }
       }
@@ -492,9 +584,28 @@ async function buildPayload(message, category) {
     link = anyEmbed?.url || message.url;
   }
 
+  // JARING PENGAMAN TERAKHIR: gak peduli title itu ditentuin lewat jalur
+  // kode yang mana di atas (richDetail, rawContent, atau fallback paling
+  // akhir), kalau ujung-ujungnya masih berupa URL mentah, JANGAN dikirim
+  // apa adanya -- paksa ambil fallback yang lebih manusiawi. Ini nutupin
+  // kemungkinan ada jalur lain (di luar yang udah dijaga di atas) yang
+  // ternyata bisa nyetel title jadi link polos juga.
+  const isUrlLikeFinal = (s) => /^https?:\/\/\S+$/.test((s || "").trim());
+  let finalTitle = cleanDiscordText(title)?.slice(0, 100);
+  if (isUrlLikeFinal(finalTitle)) {
+    const fallback =
+      firstMeaningfulLine(rawLines) ||
+      (twitterDetail && firstMeaningfulLine((twitterDetail.description || twitterDetail.title || "").split("\n")));
+    if (fallback) {
+      finalTitle = cleanDiscordText(fallback)?.slice(0, 100);
+    } else {
+      try { finalTitle = new URL(finalTitle).hostname.replace("www.", ""); } catch { finalTitle = null; }
+    }
+  }
+
   return {
     category,
-    title: cleanDiscordText(title)?.slice(0, 100) || "Garapan baru",
+    title: finalTitle || "Garapan baru",
     description: cleanDiscordText(description) || "",
     link,
     image_url: imageUrl,
