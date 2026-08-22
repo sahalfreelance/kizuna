@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { refreshAccessToken } from "@/lib/discordOAuth";
-import { verifyDiscordToken } from "@/lib/mobileAuth";
+import { verifyDiscordToken, TokenStatus } from "@/lib/mobileAuth";
 
 /**
  * POST /api/auth/refresh
@@ -15,8 +15,9 @@ import { verifyDiscordToken } from "@/lib/mobileAuth";
  * Respons gagal:
  *   401 + { error, need_relogin: true }   -> refresh token sudah mati,
  *                                            user HARUS login ulang
- *   502 + { error }                        -> Discord/jaringan bermasalah,
- *                                            app boleh coba lagi nanti
+ *   503 + { error, retryable: true }      -> Discord bermasalah / rate limit,
+ *                                            app boleh coba lagi TANPA
+ *                                            mengusir user
  *
  * CATATAN ROTASI: Discord mengganti refresh token setiap kali refresh
  * berhasil. App wajib menyimpan `refresh_token` dari respons ini dan
@@ -49,14 +50,14 @@ export async function POST(req) {
     // Bukan salah token — kemungkinan Discord down / jaringan. Jangan
     // suruh user login ulang untuk kasus ini.
     return NextResponse.json(
-      { error: "Gagal menghubungi Discord. Coba lagi nanti." },
-      { status: 502 }
+      { error: "Gagal menghubungi Discord. Coba lagi nanti.", retryable: true },
+      { status: 503 }
     );
   }
 
   const result = await verifyDiscordToken(tokens.access_token);
 
-  if (!result.user) {
+  if (result.status === TokenStatus.INVALID_TOKEN) {
     return NextResponse.json(
       {
         error: "Token Discord tidak valid setelah refresh.",
@@ -66,8 +67,28 @@ export async function POST(req) {
     );
   }
 
+  // Token baru sudah didapat, tapi keanggotaan belum bisa dipastikan.
+  // Kirim tetap token-nya (503) supaya app bisa menyimpan refresh token
+  // BARU — kalau tidak, refresh token lama sudah mati karena rotasi dan
+  // user terpaksa login ulang. Ini penting: tanpa ini, gangguan Discord
+  // sesaat bisa mematikan sesi secara permanen.
+  if (result.status === TokenStatus.UPSTREAM_ERROR) {
+    return NextResponse.json(
+      {
+        error: "Tidak bisa memverifikasi keanggotaan saat ini. Coba lagi.",
+        retryable: true,
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token ?? refreshToken,
+        expires_in: tokens.expires_in ?? null,
+      },
+      { status: 503 }
+    );
+  }
+
   return NextResponse.json({
-    ...result,
+    isMember: result.isMember,
+    isAdmin: result.isAdmin,
+    user: result.user,
     access_token: tokens.access_token,
     refresh_token: tokens.refresh_token ?? refreshToken,
     expires_in: tokens.expires_in ?? null,

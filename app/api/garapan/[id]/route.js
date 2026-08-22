@@ -1,15 +1,16 @@
 import { NextResponse } from "next/server";
-import { getAuthContext } from "@/lib/apiAuth";
+import { getAuthContext, buildDenial } from "@/lib/apiAuth";
 import { supabaseAdmin } from "@/lib/supabase";
 
-const VALID_CATEGORIES = ["CRYPTO", "NFT", "RAFFLE", "AIRDROP"];
+// MINT ditambahkan agar konsisten dengan bot & route /api/garapan.
+const VALID_CATEGORIES = ["CRYPTO", "NFT", "RAFFLE", "AIRDROP", "MINT"];
 const VALID_STATUSES = ["LIVE", "PAST"];
 
 export async function PUT(req, { params }) {
   const auth = await getAuthContext(req);
-  if (!auth?.isAdmin) {
-    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
-  }
+
+  const denied = buildDenial(auth, NextResponse, { requireAdmin: true });
+  if (denied) return denied;
 
   const body = await req.json();
   const { title, description, category, status, link, image_url } = body;
@@ -47,11 +48,14 @@ export async function PUT(req, { params }) {
 
 export async function DELETE(req, { params }) {
   const auth = await getAuthContext(req);
-  if (!auth?.isAdmin) {
-    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
-  }
 
-  const { error } = await supabaseAdmin.from("garapan").delete().eq("id", params.id);
+  const denied = buildDenial(auth, NextResponse, { requireAdmin: true });
+  if (denied) return denied;
+
+  const { error } = await supabaseAdmin
+    .from("garapan")
+    .delete()
+    .eq("id", params.id);
 
   if (error) {
     return NextResponse.json({ error: error.message }, { status: 500 });
