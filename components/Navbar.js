@@ -52,6 +52,7 @@ export default function Navbar({ session }) {
           <div style={{ display: "flex", alignItems: "center", gap: 4, overflowX: "auto" }}>
             {[
               { href: "/", label: "OVERVIEW" },
+              { href: "/alpha", label: "ALPHA" },
               { href: "/aco", label: "ACO" },
               { href: "/inscription", label: "INSCRIPTION" },
               { href: "/collab-request", label: "REQUEST COLLAB" },

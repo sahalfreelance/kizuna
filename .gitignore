@@ -1,1 +1,19 @@
+# deps
+node_modules/
+bot/node_modules/
+
+# build Next.js
+.next/
+out/
+
+# env (JANGAN pernah di-commit)
+.env
+.env.local
+.env*.local
 bot/.env
+alphagate.env
+
+# log & cache
+*.log
+.DS_Store
+.vercel
