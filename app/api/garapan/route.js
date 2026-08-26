@@ -1,15 +1,22 @@
 import { NextResponse } from "next/server";
-import { getAuthContext } from "@/lib/apiAuth";
+import { getAuthContext, buildDenial } from "@/lib/apiAuth";
 import { supabaseAdmin } from "@/lib/supabase";
 
-const VALID_CATEGORIES = ["CRYPTO", "NFT", "RAFFLE", "AIRDROP"];
+// MINT ditambahkan: bot sudah mengirim kategori ini (lihat bot/garapan-bot.js
+// MINT_CHANNEL_ID), tapi daftar ini belum memuatnya — jadi POST manual
+// dengan category MINT ditolak 400 padahal datanya sah.
+const VALID_CATEGORIES = ["CRYPTO", "NFT", "RAFFLE", "AIRDROP", "MINT"];
 const VALID_STATUSES = ["LIVE", "PAST"];
 
 export async function GET(req) {
   const auth = await getAuthContext(req);
-  if (!auth?.isMember) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+
+  // PERUBAHAN: dulu semua kegagalan -> 401 Unauthorized, termasuk saat
+  // Discord rate limit. App mobile menganggap 401 = sesi mati, membuang
+  // token, lalu menampilkan "Sesi berakhir". Sekarang gangguan Discord
+  // dibalas 503 (retryable) supaya sesi user tidak dihapus.
+  const denied = buildDenial(auth, NextResponse);
+  if (denied) return denied;
 
   const { data, error } = await supabaseAdmin
     .from("garapan")
@@ -24,9 +31,9 @@ export async function GET(req) {
 
 export async function POST(req) {
   const auth = await getAuthContext(req);
-  if (!auth?.isAdmin) {
-    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
-  }
+
+  const denied = buildDenial(auth, NextResponse, { requireAdmin: true });
+  if (denied) return denied;
 
   const body = await req.json();
   const { title, description, category, status, link, image_url } = body;
