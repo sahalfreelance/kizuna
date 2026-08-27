@@ -3,7 +3,10 @@ import { getAuthContext, buildDenial } from "@/lib/apiAuth";
 import { supabaseAdmin } from "@/lib/supabase";
 
 const VALID_SECTIONS = ["TRENDING", "NEWS", "FEED"];
-const MAX_LIMIT = 100;
+// Naik dari 100. Halaman /alpha memuat awal dengan limit 300, jadi batas 100
+// di sini bikin polling mengembalikan lebih sedikit data daripada muatan
+// awal -- section yang timestamp-nya paling tua (TRENDING) kepotong habis.
+const MAX_LIMIT = 500;
 
 // Dipakai halaman /alpha buat polling data (mirip /api/garapan).
 // Auth-nya sama: harus member Discord House of Kizuna.

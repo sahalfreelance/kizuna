@@ -1,10 +1,9 @@
-import { getServerSession } from "next-auth";
-import { authOptions } from "@/lib/auth";
+import { getPageSession } from "@/lib/pageSession";
 import Navbar from "@/components/Navbar";
 import ComingSoon from "@/components/ComingSoon";
 
 export default async function InscriptionPage() {
-  const session = await getServerSession(authOptions);
+  const session = getPageSession();
   return (
     <>
       <Navbar session={session} />

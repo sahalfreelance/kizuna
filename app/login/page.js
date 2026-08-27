@@ -1,14 +1,17 @@
-import { getServerSession } from "next-auth";
 import { redirect } from "next/navigation";
-import { authOptions } from "@/lib/auth";
-import LoginButton from "@/components/LoginButton";
+import { cookies } from "next/headers";
+import { verifySessionToken, SESSION_COOKIE } from "@/lib/localAuth";
+import LoginForm from "@/components/LoginForm";
 
-export default async function LoginPage({ searchParams }) {
-  const session    = await getServerSession(authOptions);
+export const dynamic = "force-dynamic";
+
+export default function LoginPage({ searchParams }) {
   const callbackUrl = searchParams?.callbackUrl || "/";
 
-  if (session) {
-    redirect(session.isMember ? callbackUrl : "/not-member");
+  // Sudah punya sesi yang sah -> jangan tampilkan form lagi.
+  const token = cookies().get(SESSION_COOKIE)?.value;
+  if (token && verifySessionToken(token).ok) {
+    redirect(callbackUrl);
   }
 
   return (
@@ -47,14 +50,14 @@ export default async function LoginPage({ searchParams }) {
         border: "1px solid var(--border)",
         borderTop: "2px solid var(--indigo)",
         borderRadius: 8,
-        padding: "36px 40px",
+        padding: "32px 36px",
         maxWidth: 440, width: "100%",
         textAlign: "left",
       }}>
         {/* terminal title bar */}
         <div style={{
           display: "flex", alignItems: "center", gap: 6,
-          marginBottom: 24, paddingBottom: 16,
+          marginBottom: 22, paddingBottom: 14,
           borderBottom: "1px solid var(--border)",
         }}>
           <span style={{ width: 9, height: 9, borderRadius: "50%", background: "#ff5f57", display: "inline-block" }} />
@@ -66,21 +69,21 @@ export default async function LoginPage({ searchParams }) {
         </div>
 
         {/* boot lines */}
-        <div style={{ fontSize: 11, color: "var(--text-dim)", lineHeight: 2, marginBottom: 20 }}>
-          <div><span style={{ color: "var(--indigo-dim)" }}>$</span> Checking membership status...</div>
-          <div><span style={{ color: "#f87171" }}>✗</span> Unauthorized. Authentication required.</div>
-          <div><span style={{ color: "var(--indigo-dim)" }}>$</span> Initiating Discord OAuth...</div>
+        <div style={{ fontSize: 11, color: "var(--text-dim)", lineHeight: 2, marginBottom: 18 }}>
+          <div><span style={{ color: "var(--indigo-dim)" }}>$</span> Checking session...</div>
+          <div><span style={{ color: "#f87171" }}>✗</span> No valid session found.</div>
+          <div><span style={{ color: "var(--indigo-dim)" }}>$</span> Awaiting credentials...</div>
         </div>
 
         <h1 style={{ fontSize: 18, fontWeight: 700, color: "var(--text)", marginBottom: 8, letterSpacing: 0.3 }}>
           Access Terminal
         </h1>
-        <p style={{ fontSize: 12, color: "var(--text-mid)", marginBottom: 24, lineHeight: 1.7 }}>
+        <p style={{ fontSize: 12, color: "var(--text-mid)", marginBottom: 22, lineHeight: 1.7 }}>
           Log board ini cuma buat anggota server.<br />
-          Login pakai akun Discord yang udah gabung di komunitas.
+          Masuk pakai username &amp; password dari bot Discord.
         </p>
 
-        <LoginButton callbackUrl={callbackUrl} />
+        <LoginForm callbackUrl={callbackUrl} />
       </div>
     </main>
   );

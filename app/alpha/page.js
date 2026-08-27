@@ -1,5 +1,4 @@
-import { getServerSession } from "next-auth";
-import { authOptions } from "@/lib/auth";
+import { getPageSession } from "@/lib/pageSession";
 import { supabaseAdmin } from "@/lib/supabase";
 import Navbar from "@/components/Navbar";
 import AlphaDashboard from "@/components/AlphaDashboard";
@@ -7,7 +6,7 @@ import AlphaDashboard from "@/components/AlphaDashboard";
 export const dynamic = "force-dynamic";
 
 export default async function AlphaPage() {
-  const session = await getServerSession(authOptions);
+  const session = getPageSession();
 
   const { data, error } = await supabaseAdmin
     .from("alpha_items")

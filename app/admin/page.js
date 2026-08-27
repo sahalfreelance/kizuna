@@ -1,6 +1,5 @@
-import { getServerSession } from "next-auth";
 import { redirect } from "next/navigation";
-import { authOptions } from "@/lib/auth";
+import { getPageSession } from "@/lib/pageSession";
 import { supabaseAdmin } from "@/lib/supabase";
 import Navbar from "@/components/Navbar";
 import AdminPanel from "@/components/AdminPanel";
@@ -8,7 +7,7 @@ import AdminPanel from "@/components/AdminPanel";
 export const dynamic = "force-dynamic";
 
 export default async function AdminPage() {
-  const session = await getServerSession(authOptions);
+  const session = getPageSession();
   if (!session?.isAdmin) {
     redirect("/");
   }

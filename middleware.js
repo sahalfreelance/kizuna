@@ -1,7 +1,9 @@
-import { getToken } from "next-auth/jwt";
 import { NextResponse } from "next/server";
+import { verifySessionTokenEdge, SESSION_COOKIE } from "@/lib/sessionEdge";
 
-const PUBLIC_PATHS = ["/login", "/not-member", "/api/auth", "/api/garapan", "/api/alpha", "/api/webhook/"];
+// /api/* diurus masing-masing route (mereka yang tahu harus balas 401 / 403 /
+// 503). Middleware cuma menjaga halaman.
+const PUBLIC_PATHS = ["/login", "/not-member", "/api/"];
 
 export async function middleware(req) {
   const { pathname } = req.nextUrl;
@@ -10,19 +12,25 @@ export async function middleware(req) {
     return NextResponse.next();
   }
 
-  const token = await getToken({ req, secret: process.env.NEXTAUTH_SECRET });
+  // Verifikasi HMAC saja — TIDAK query database. Middleware jalan di Edge di
+  // setiap request, jadi harus murah. Pengecekan session_version terhadap DB
+  // dilakukan di lib/apiAuth.js saat route API dipanggil.
+  const token = req.cookies.get(SESSION_COOKIE)?.value;
+  const result = await verifySessionTokenEdge(token);
 
-  if (!token) {
+  if (!result.ok) {
     const loginUrl = new URL("/login", req.url);
     loginUrl.searchParams.set("callbackUrl", pathname);
-    return NextResponse.redirect(loginUrl);
+
+    const res = NextResponse.redirect(loginUrl);
+    // Cookie busuk/kedaluwarsa dibersihkan, biar tidak loop redirect.
+    if (token) {
+      res.cookies.set(SESSION_COOKIE, "", { path: "/", maxAge: 0 });
+    }
+    return res;
   }
 
-  if (!token.isMember) {
-    return NextResponse.redirect(new URL("/not-member", req.url));
-  }
-
-  if (pathname.startsWith("/admin") && !token.isAdmin) {
+  if (pathname.startsWith("/admin") && result.payload.adm !== 1) {
     return NextResponse.redirect(new URL("/", req.url));
   }
 

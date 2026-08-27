@@ -39,6 +39,18 @@ const SECTIONS = [
 
 const POLL_INTERVAL_MS = 20000;
 
+// Polling minta PER SECTION, bukan sekali ambil semua.
+//
+// Bug sebelumnya: muatan awal halaman pakai limit 300 (semua data), tapi
+// polling pakai limit=100 lalu MENIMPA seluruh state. Data diurut
+// source_timestamp DESC, dan item TRENDING (profil project) timestamp-nya
+// lebih tua daripada tweet/launch yang masuk terus -- jadi TRENDING
+// kepotong habis dari 100 teratas dan tab-nya jadi kosong setelah 20 detik.
+//
+// Per-section bikin tiap section punya kuota sendiri, jadi nggak bisa saling
+// menggusur, dan tetap aman walau data tumbuh jadi ribuan.
+const POLL_LIMIT_PER_SECTION = 150;
+
 export default function AlphaDashboard({ items: initialItems }) {
   const [items, setItems] = useState(initialItems);
   const [section, setSection] = useState("TRENDING");
@@ -62,19 +74,34 @@ export default function AlphaDashboard({ items: initialItems }) {
 
       setIsSyncing(true);
       try {
-        const res = await fetch("/api/alpha?limit=100", { cache: "no-store" });
-        if (!res.ok) return;
+        // Satu request per section supaya section yang timestamp-nya tua
+        // (TRENDING) nggak tergusur oleh section yang datanya sering masuk.
+        const results = await Promise.all(
+          SECTIONS.map((s) =>
+            fetch(
+              `/api/alpha?section=${s.key}&limit=${POLL_LIMIT_PER_SECTION}`,
+              { cache: "no-store" }
+            )
+              .then((res) => (res.ok ? res.json() : null))
+              .catch(() => null)
+          )
+        );
 
-        const json = await res.json();
-        if (cancelled || !json.data) return;
+        if (cancelled) return;
 
-        const fresh = json.data.filter((i) => !seenRef.current.has(i.id));
+        // Kalau ADA section yang gagal, jangan timpa state — lebih baik
+        // pakai data lama daripada menampilkan section kosong palsu.
+        if (results.some((r) => !r || !Array.isArray(r.data))) return;
+
+        const merged = results.flatMap((r) => r.data);
+
+        const fresh = merged.filter((i) => !seenRef.current.has(i.id));
         if (fresh.length > 0) setNewCount((c) => c + fresh.length);
-        json.data.forEach((i) => seenRef.current.add(i.id));
+        merged.forEach((i) => seenRef.current.add(i.id));
 
-        if (JSON.stringify(json.data) !== JSON.stringify(itemsRef.current)) {
-          itemsRef.current = json.data;
-          setItems(json.data);
+        if (JSON.stringify(merged) !== JSON.stringify(itemsRef.current)) {
+          itemsRef.current = merged;
+          setItems(merged);
         }
       } catch {
         // diem-diem aja, coba lagi siklus berikutnya

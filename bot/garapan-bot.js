@@ -7,6 +7,8 @@
 const { Client, GatewayIntentBits, Events } = require("discord.js");
 require("dotenv").config();
 
+const { registerAccountCommands } = require("./account-commands");
+
 const {
   DISCORD_BOT_TOKEN,
   WEBSITE_URL,
@@ -43,7 +45,7 @@ if (Object.keys(CHANNEL_CATEGORY_MAP).length === 0) {
 
 // Naikin angka ini tiap kali update kode, biar gampang ngecek di log
 // versi mana yang beneran lagi jalan (pm2 logs garapan-bot).
-const BOT_VERSION = "v22";
+const BOT_VERSION = "v23";
 
 const client = new Client({
   intents: [
@@ -52,6 +54,11 @@ const client = new Client({
     GatewayIntentBits.MessageContent,
   ],
 });
+
+// Command akun buat login website: /register, /change-password,
+// /reset-device, /my-account. Daftarin ke Discord dengan
+// `node deploy-commands.js` (sekali, atau tiap kali daftar command berubah).
+registerAccountCommands(client);
 
 client.once(Events.ClientReady, (c) => {
   console.log(`Bot aktif sebagai ${c.user.tag} [${BOT_VERSION}]. Channel yang dipantau:`);

@@ -1,5 +1,4 @@
-import { getServerSession } from "next-auth";
-import { authOptions } from "@/lib/auth";
+import { getPageSession } from "@/lib/pageSession";
 import { supabaseAdmin } from "@/lib/supabase";
 import Navbar from "@/components/Navbar";
 import Dashboard from "@/components/Dashboard";
@@ -7,7 +6,7 @@ import Dashboard from "@/components/Dashboard";
 export const dynamic = "force-dynamic";
 
 export default async function HomePage() {
-  const session = await getServerSession(authOptions);
+  const session = getPageSession();
 
   const { data, error } = await supabaseAdmin
     .from("garapan")
