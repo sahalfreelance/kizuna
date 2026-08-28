@@ -1,6 +1,7 @@
 # deps
 node_modules/
 bot/node_modules/
+aco-worker/node_modules/
 
 # build Next.js
 .next/
@@ -11,6 +12,7 @@ out/
 .env.local
 .env*.local
 bot/.env
+aco-worker/.env
 alphagate.env
 
 # log & cache

@@ -1,111 +1,112 @@
-# Patch: login username + password (1 user 1 device)
+# Patch: ACO (Auto Checkout) multi-user
 
-Discord OAuth dibuang total. Panduan deploy lengkap ada di `DEPLOY_AUTH.md`.
+Panduan deploy lengkap: `DEPLOY_ACO.md`.
 
 ## Cara pasang
-
-Extract zip ini, lalu dari dalam repo:
 
 ```bash
 cd ~/kizuna
 
-# 1. Copy semua file patch — struktur foldernya sudah sama dengan repo
-cp -r /path/ke/kizuna_auth_patch/. .
-rm -f PASANG.md          # file ini nggak perlu masuk repo
+# 1. Copy semua file — struktur foldernya sudah sama dengan repo
+cp -r /path/ke/kizuna_aco_patch/. .
+rm -f PASANG.md          # file ini tidak perlu masuk repo
 
-# 2. Hapus file Discord OAuth yang sudah tidak dipakai
-git rm -r -q "app/api/auth/[...nextauth]" \
-             app/api/auth/exchange \
-             app/api/auth/refresh \
-             app/api/auth/verify
-git rm -q components/LoginButton.js \
-          lib/auth.js \
-          lib/discord.js \
-          lib/discordOAuth.js \
-          lib/mobileAuth.js
+# 2. Install dependency
+npm install              # + ethers (dipakai /api/aco/wallets buat turunkan address)
+cd aco-worker && npm install && cd ..
 
-# 3. bot/node_modules sebelumnya ke-track di git (3055 file) — keluarkan.
-#    File di disk tetap ada, cuma nggak ikut ke repo lagi.
-git rm -r -q --cached bot/node_modules 2>/dev/null || true
-
-# 4. Install dependency
-npm install                 # next-auth dicabut dari package.json
-cd bot && npm install       # + @supabase/supabase-js
-cd ..
-
-# 5. Build lokal dulu SEBELUM push
+# 3. Build lokal SEBELUM push
 NEXT_PUBLIC_SUPABASE_URL="https://dummy.supabase.co" \
 SUPABASE_SERVICE_ROLE_KEY="dummy" \
-AUTH_SESSION_SECRET="dummy-secret-panjang-buat-build" \
+AUTH_SESSION_SECRET="dummy-panjang" \
+WALLET_ENCRYPTION_KEY="$(openssl rand -base64 32)" \
 npx next build
 ```
 
-Harus muncul `✓ Compiled successfully` dengan route:
+Harus `✓ Compiled successfully` dengan route:
 ```
-├ ƒ /api/auth/login
-├ ƒ /api/auth/logout
-├ ƒ /api/auth/me
-├ ƒ /login
-ƒ Middleware
+├ ƒ /aco
+├ ƒ /api/aco/drop
+├ ƒ /api/aco/jobs
+├ ƒ /api/aco/jobs/[id]
+├ ƒ /api/aco/wallets
+├ ƒ /api/aco/wallets/[id]
 ```
-
-Kalau build gagal, JANGAN push.
 
 ```bash
-# 6. Cek nggak ada secret / node_modules mau ke-commit
+# 4. Cek tidak ada secret / node_modules mau ke-commit
+git add -A
 git status --short | grep -E "\.env$|node_modules" && echo "STOP" || echo "aman"
 
-# 7. Commit & push
-git add -A
-git commit -m "feat(auth): login username+password, akun via bot Discord, 1 user 1 device"
+# 5. Commit & push
+git commit -m "feat(aco): auto checkout multi-user, worker di VPS"
 git push origin main
 ```
 
 ## Isi patch
 
-**File baru**
+**Website**
 ```
-supabase/migration_add_app_users.sql   ← JALANKAN DULU di Supabase
-lib/localAuth.js                       scrypt hash + token HMAC
-lib/sessionEdge.js                     verifikasi token via Web Crypto (Edge-safe)
-lib/pageSession.js                     baca sesi di Server Component
-app/api/auth/login/route.js
-app/api/auth/logout/route.js
-app/api/auth/me/route.js
-components/LoginForm.js
-bot/account-commands.js                /register /change-password /reset-device /my-account
-bot/deploy-commands.js                 daftarin slash command ke Discord
-bot/lib/localAuth.js                   salinan CommonJS — format hash HARUS sama
-bot/lib/supabase.js
-```
-
-**File diubah**
-```
-lib/apiAuth.js            cookie + Bearer token lokal, Discord dibuang
-middleware.js             verifikasi HMAC di Edge, tanpa query DB
-app/login/page.js         form username+password
-components/SignOutButton.js
-app/{page,alpha,aco,inscription,admin}/page.js   getServerSession -> getPageSession
-package.json              next-auth dicabut
-bot/garapan-bot.js        +registerAccountCommands, versi v23
-bot/package.json          +@supabase/supabase-js
-.env.example / bot/.env.example
-.gitignore
+supabase/migration_add_aco.sql      ← JALANKAN DULU di Supabase
+lib/walletCrypto.js                 AES-256-GCM encrypt/decrypt
+app/api/aco/wallets/route.js        GET daftar · POST import
+app/api/aco/wallets/[id]/route.js   DELETE · PATCH
+app/api/aco/jobs/route.js           GET daftar · POST bikin job
+app/api/aco/jobs/[id]/route.js      GET detail+log · DELETE batal
+app/api/aco/drop/route.js           proxy info drop OpenSea
+app/aco/page.js                     ganti ComingSoon
+components/AcoDashboard.js          UI: wallet + job + log realtime
+package.json                        + ethers
+.env.example                        + WALLET_ENCRYPTION_KEY
+.gitignore                          + aco-worker/
 ```
 
-## Env baru yang WAJIB
+**Worker VPS**
+```
+aco-worker/worker.js                loop: claim job → login → tunggu → mint
+aco-worker/package.json
+aco-worker/.env.example
+aco-worker/lib/walletCrypto.js      salinan ESM — format HARUS sama
+aco-worker/lib/supabase.js
+aco-worker/lib/jobLogger.js         tulis ke aco_logs + stdout
+aco-worker/lib/auth.js              ← dari script CLI kamu
+aco-worker/lib/graphql.js           ← dari script CLI kamu
+aco-worker/lib/mint.js              ← dari script CLI kamu
+ecosystem.config.js                 pm2: garapan-bot + kizuna-aco-worker
+```
+
+`auth.js`, `graphql.js`, `mint.js` dipakai **apa adanya** dari script CLI kamu.
+Satu perubahan kecil di `auth.js`: pemeriksaan `OPENSEA_API_KEY` dipindah dari
+top-level ke dalam fungsi, supaya worker bisa melaporkan env yang kurang dengan
+pesan jelas alih-alih stack trace.
+
+## Env baru
 
 **Vercel:**
 ```
-AUTH_SESSION_SECRET=<openssl rand -base64 48>
+WALLET_ENCRYPTION_KEY=<openssl rand -base64 32>
 ```
 
-**bot/.env:**
+**aco-worker/.env:**
 ```
-DISCORD_CLIENT_ID=
-AUTH_CHANNEL_ID=
+RPC_URL=
+CHAIN_ID=1
 NEXT_PUBLIC_SUPABASE_URL=
 SUPABASE_SERVICE_ROLE_KEY=
+WALLET_ENCRYPTION_KEY=      ← SAMA PERSIS dengan yang di Vercel
+OPENSEA_API_KEY=
 ```
 
-Detail + urutan lengkap: baca `DEPLOY_AUTH.md`.
+`WALLET_ENCRYPTION_KEY` harus identik di kedua tempat. Kalau beda, worker tidak
+bisa mendekripsi wallet dan semua job gagal.
+
+## Jalankan worker
+
+```bash
+cd ~/kizuna/aco-worker
+node worker.js --check          # uji semua env dulu
+
+cd ~/kizuna
+pm2 start ecosystem.config.js --only kizuna-aco-worker
+pm2 save
+```

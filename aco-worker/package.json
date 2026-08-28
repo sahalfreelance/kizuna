@@ -1,0 +1,17 @@
+{
+  "name": "kizuna-aco-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "worker.js",
+  "scripts": {
+    "start": "node worker.js",
+    "check": "node worker.js --check"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.4",
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.5",
+    "node-fetch": "^3.3.2"
+  }
+}

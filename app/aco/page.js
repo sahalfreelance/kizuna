@@ -1,17 +1,16 @@
 import { getPageSession } from "@/lib/pageSession";
 import Navbar from "@/components/Navbar";
-import ComingSoon from "@/components/ComingSoon";
+import AcoDashboard from "@/components/AcoDashboard";
 
-export default async function AcoPage() {
+export const dynamic = "force-dynamic";
+
+export default function AcoPage() {
   const session = getPageSession();
+
   return (
     <>
       <Navbar session={session} />
-      <ComingSoon
-        label="root@kizuna: ~/aco"
-        title="Auto Checkout (ACO)"
-        note="Fitur checkout otomatis buat mint/raffle lagi disiapin. Section ini bakal punya halamannya sendiri, terpisah dari Inscription."
-      />
+      <AcoDashboard />
     </>
   );
 }
