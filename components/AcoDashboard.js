@@ -547,6 +547,105 @@ function WalletManager({ wallets, limit, onChange }) {
   );
 }
 
+/* ================================================== ELIGIBILITY BADGE */
+
+/**
+ * Label eligibility di samping stage.
+ *
+ * Bentuknya:
+ *   1 wallet  -> "ELIGIBLE" / "NOT ELIGIBLE"
+ *   2 wallet  -> "ELIGIBLE 2/2" / "ELIGIBLE 1/2" / "NOT ELIGIBLE"
+ *
+ * `unknown` DIBEDAKAN dari `not eligible`. Kalau data tidak terbaca (error
+ * jaringan, field ditolak), menampilkan "NOT ELIGIBLE" akan membuat user
+ * membatalkan mint yang sebenarnya bisa — jadi ditandai "?" saja.
+ */
+function EligBadge({ summary, totalWallets, state }) {
+  if (state === "checking") {
+    return (
+      <span style={{ fontSize: 9, color: "var(--text-dim)", letterSpacing: 0.5 }}>
+        CEK…
+      </span>
+    );
+  }
+
+  if (!summary) return null;
+
+  const { eligibleCount, notEligibleCount, unknownCount, checkedWallets } = summary;
+  const multi = totalWallets > 1;
+
+  // Semua wallet gagal dibaca.
+  if (checkedWallets > 0 && unknownCount === checkedWallets) {
+    return (
+      <span
+        style={{
+          fontSize: 9,
+          letterSpacing: 0.5,
+          color: "var(--text-dim)",
+          border: "1px solid var(--border)",
+          borderRadius: 3,
+          padding: "1px 5px",
+        }}
+      >
+        ? TIDAK DIKETAHUI
+      </span>
+    );
+  }
+
+  const eligible = eligibleCount > 0;
+  const color = eligible ? "var(--crypto)" : "#f87171";
+
+  return (
+    <span
+      style={{
+        fontSize: 9,
+        letterSpacing: 0.5,
+        fontWeight: 700,
+        color,
+        border: `1px solid ${color}`,
+        borderRadius: 3,
+        padding: "1px 5px",
+        whiteSpace: "nowrap",
+      }}
+    >
+      {eligible
+        ? multi
+          ? `ELIGIBLE ${eligibleCount}/${totalWallets}`
+          : "ELIGIBLE"
+        : "NOT ELIGIBLE"}
+    </span>
+  );
+}
+
+/**
+ * Rincian per wallet di bawah baris stage.
+ *
+ * `ELIGIBLE 1/2` tanpa keterangan memaksa user menebak wallet mana yang lolos,
+ * jadi daftarnya ditampilkan. Hanya muncul kalau wallet lebih dari satu.
+ */
+function EligWalletDetail({ elig, stageIndex }) {
+  if (!elig?.wallets?.length || elig.wallets.length < 2) return null;
+
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 4 }}>
+      {elig.wallets.map((w) => {
+        const st = w.stages?.find((s) => s.stageIndex === stageIndex);
+        const val = st?.eligible;
+        const color =
+          val === true ? "var(--crypto)" : val === false ? "#f87171" : "var(--text-dim)";
+        const mark = val === true ? "✓" : val === false ? "✗" : "?";
+
+        return (
+          <span key={w.walletId} style={{ fontSize: 9, color }}>
+            {mark} {w.label}
+            {val === true && st?.maxMintable ? ` (max ${st.maxMintable})` : ""}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
 /* =========================================================== JOB CREATOR */
 
 function JobCreator({ wallets, chains, platform, onCreated }) {
@@ -564,6 +663,12 @@ function JobCreator({ wallets, chains, platform, onCreated }) {
   // per job.
   const [abortOnRevert, setAbortOnRevert] = useState(true);
   const [maxAttempts, setMaxAttempts] = useState(3);
+
+  // Hasil eligibility check dari worker. `eligState`:
+  //   idle | checking | done | error | timeout
+  const [elig, setElig] = useState(null);
+  const [eligState, setEligState] = useState("idle");
+  const [eligError, setEligError] = useState(null);
 
   // Chain ditampilkan sebagai Ethereum secara default, lalu DIGANTI otomatis
   // dengan chain asli hasil deteksi saat slug dicek. User tidak memilih sendiri
@@ -586,6 +691,9 @@ function JobCreator({ wallets, chains, platform, onCreated }) {
     setError(null);
     setDrop(null);
     setStageIdx(null);
+    setElig(null);
+    setEligState("idle");
+    setEligError(null);
     setLoading(true);
     try {
       const res = await fetch(`/api/aco/drop?slug=${encodeURIComponent(slug.trim())}`);
@@ -597,7 +705,12 @@ function JobCreator({ wallets, chains, platform, onCreated }) {
       setDrop(json.data);
       if (!json.data.stages?.length) {
         setError("Collection ini tidak punya mint stage.");
+        return;
       }
+      // Eligibility check dijalankan BERSAMAAN dengan cek slug, tidak menunggu
+      // klik terpisah. Tidak di-await supaya info drop langsung tampil —
+      // checker butuh SIWE login (~2-4 detik) di worker VPS.
+      startEligibilityCheck(json.data.slug);
     } catch {
       setError("Tidak bisa menghubungi server.");
     } finally {
@@ -605,8 +718,77 @@ function JobCreator({ wallets, chains, platform, onCreated }) {
     }
   }
 
+  /**
+   * Titipkan pengecekan ke worker, lalu polling hasilnya.
+   *
+   * Kenapa lewat worker: field eligibility di OpenSea dikunci di balik auth,
+   * dan SIWE login butuh private key wallet yang hanya didekripsi di VPS.
+   */
+  async function startEligibilityCheck(checkSlug) {
+    setEligState("checking");
+    setEligError(null);
+    setElig(null);
+
+    try {
+      const res = await fetch("/api/aco/eligibility", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ slug: checkSlug }),
+      });
+      const json = await res.json().catch(() => ({}));
+
+      if (!res.ok) {
+        setEligState("error");
+        setEligError(json.error || "Gagal mulai pengecekan.");
+        return;
+      }
+
+      const checkId = json.data.id;
+
+      // Polling maksimal ~40 detik. Worker biasanya selesai dalam 2-6 detik
+      // (2 wallet x SIWE login), tapi kalau worker mati kita harus berhenti
+      // daripada polling selamanya.
+      for (let i = 0; i < 40; i++) {
+        await new Promise((r) => setTimeout(r, 1000));
+
+        const pRes = await fetch(`/api/aco/eligibility?id=${checkId}`, {
+          cache: "no-store",
+        });
+        if (!pRes.ok) continue;
+
+        const pJson = await pRes.json().catch(() => ({}));
+        const row = pJson.data;
+        if (!row) continue;
+
+        if (row.status === "DONE") {
+          setElig(row.result);
+          setEligState("done");
+          return;
+        }
+        if (row.status === "FAILED") {
+          setEligState("error");
+          setEligError(row.error_message || "Pengecekan gagal.");
+          return;
+        }
+      }
+
+      setEligState("timeout");
+      setEligError(
+        "Worker belum merespons. Cek worker di VPS jalan atau tidak (pm2 logs kizuna-aco-worker)."
+      );
+    } catch {
+      setEligState("error");
+      setEligError("Tidak bisa menghubungi server.");
+    }
+  }
+
   const stage = stageIdx != null ? drop?.stages?.[stageIdx] : null;
   const maxPerWallet = stage?.maxTotalMintableByWallet || 1;
+
+  // Ringkasan eligibility per stageIndex, dipakai badge di tiap baris stage.
+  const eligByStage = new Map(
+    (elig?.stages ?? []).map((s) => [s.stageIndex, s])
+  );
 
   function toggleWallet(id) {
     setSelected((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
@@ -750,6 +932,82 @@ function JobCreator({ wallets, chains, platform, onCreated }) {
 
       {drop && drop.stages?.length > 0 && drop.chainSupported && (
         <>
+          {/* Status pengecekan eligibility. Ditampilkan terpisah dari badge
+              supaya kegagalan checker tidak menghalangi pembuatan job —
+              checker itu bantuan, bukan syarat. */}
+          {eligState !== "idle" && (
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 7,
+                background: "var(--bg2)",
+                border: "1px solid var(--border)",
+                borderRadius: 4,
+                padding: "6px 10px",
+                fontSize: 10.5,
+                marginBottom: 10,
+              }}
+            >
+              <span style={{ color: "var(--text-dim)" }}>ELIGIBILITY</span>
+              {eligState === "checking" && (
+                <span style={{ color: "var(--live)" }}>
+                  cek wallet di worker… (SIWE login ~2-4s)
+                </span>
+              )}
+              {eligState === "done" && (
+                <>
+                  <span style={{ color: "var(--crypto)" }}>
+                    {elig?.totalWallets ?? 0} wallet dicek
+                  </span>
+                  {elig?.wallets?.some((w) => !w.ok) && (
+                    <span style={{ color: "#f87171", fontSize: 10 }}>
+                      · {elig.wallets.filter((w) => !w.ok).length} gagal:{" "}
+                      {elig.wallets.find((w) => !w.ok)?.error?.slice(0, 70)}
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => startEligibilityCheck(drop.slug)}
+                    style={{
+                      marginLeft: "auto",
+                      background: "transparent",
+                      border: "none",
+                      color: "var(--indigo-dim)",
+                      cursor: "pointer",
+                      fontSize: 10,
+                      fontFamily: "var(--font-mono)",
+                      padding: 0,
+                    }}
+                  >
+                    cek ulang
+                  </button>
+                </>
+              )}
+              {(eligState === "error" || eligState === "timeout") && (
+                <>
+                  <span style={{ color: "#f87171" }}>{eligError}</span>
+                  <button
+                    type="button"
+                    onClick={() => startEligibilityCheck(drop.slug)}
+                    style={{
+                      marginLeft: "auto",
+                      background: "transparent",
+                      border: "none",
+                      color: "var(--indigo-dim)",
+                      cursor: "pointer",
+                      fontSize: 10,
+                      fontFamily: "var(--font-mono)",
+                      padding: 0,
+                    }}
+                  >
+                    coba lagi
+                  </button>
+                </>
+              )}
+            </div>
+          )}
+
           <label style={label}>PILIH STAGE</label>
           <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 14 }}>
             {drop.stages.map((s, i) => {
@@ -775,12 +1033,20 @@ function JobCreator({ wallets, chains, platform, onCreated }) {
                     fontFamily: "var(--font-mono)",
                   }}
                 >
-                  <div style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 11.5 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 11.5, flexWrap: "wrap" }}>
                     <span style={{ color: ended ? "var(--text-dim)" : live ? "var(--live)" : "var(--crypto)" }}>
                       {ended ? "ENDED" : live ? "● LIVE" : "SOON"}
                     </span>
                     <span style={{ color: "var(--text)" }}>{s.label}</span>
                     <span style={{ color: "var(--text-dim)", fontSize: 10 }}>{s.stageType}</span>
+
+                    {/* Label eligibility hasil pengecekan worker. */}
+                    <EligBadge
+                      summary={eligByStage.get(s.stageIndex)}
+                      totalWallets={elig?.totalWallets ?? 0}
+                      state={eligState}
+                    />
+
                     <span style={{ marginLeft: "auto", color: "var(--text-dim)", fontSize: 10 }}>
                       max {s.maxTotalMintableByWallet}
                     </span>
@@ -791,6 +1057,11 @@ function JobCreator({ wallets, chains, platform, onCreated }) {
                       <span style={{ color: "var(--live)" }}> · {countdown(s.startTime)}</span>
                     )}
                   </div>
+
+                  {/* Rincian per wallet — muncul kalau lebih dari 1 wallet. */}
+                  {eligState === "done" && (
+                    <EligWalletDetail elig={elig} stageIndex={s.stageIndex} />
+                  )}
                 </button>
               );
             })}

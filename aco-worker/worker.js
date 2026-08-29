@@ -9,6 +9,7 @@ import { getChain, SUPPORTED_CHAINS } from "./lib/chains.js";
 import { RpcPool } from "./lib/rpcPool.js";
 import { statsSnapshot } from "./lib/rateLimiter.js";
 import { mintWalletGuarded } from "./lib/mintGuarded.js";
+import { drainEligibilityQueue } from "./lib/eligWorker.js";
 import { siweLogin } from "./lib/auth.js";
 import { fetchDropInfo } from "./lib/graphql.js";
 
@@ -38,7 +39,7 @@ const CONFIG = {
   MAX_LATE_MS: parseInt(process.env.MAX_LATE_MS) || 5 * 60 * 1000,
 };
 
-const WORKER_VERSION = "v2";
+const WORKER_VERSION = "v3";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const ts = () => new Date().toISOString().replace("T", " ").slice(0, 19) + " UTC";
@@ -617,6 +618,20 @@ async function main() {
   console.log("  Catatan: RPC publik di atas rate-limit-nya ketat. Untuk mint");
   console.log("  kompetitif, user sebaiknya simpan RPC sendiri di halaman /aco.");
 
+  // Tabel eligibility check: kalau belum ada, checker tidak jalan tapi mint
+  // tetap bisa. Dilaporkan sebagai peringatan, bukan error fatal.
+  const { error: eligError } = await supabase
+    .from("aco_elig_checks")
+    .select("id", { count: "exact", head: true });
+
+  if (eligError) {
+    console.log("");
+    console.log("  ⚠ Tabel aco_elig_checks belum ada — eligibility checker OFF.");
+    console.log("    Jalankan supabase/migration_aco_eligibility.sql.");
+  } else {
+    console.log("  ✓ Eligibility checker siap");
+  }
+
   if (checkOnly) {
     console.log("");
     console.log("  Semua pemeriksaan lolos. Worker siap dijalankan.");
@@ -636,17 +651,37 @@ async function main() {
   // jaringan penuh, menjalankan dua job berbarengan justru saling melambatkan.
   while (true) {
     try {
+      // Eligibility check DIDAHULUKAN: user sedang menunggu di depan layar dan
+      // pengecekannya cepat (~2-4s), sementara job mint biasanya masih
+      // menunggu jadwal. Kalau job mint didahulukan, pengecekan bisa tertahan
+      // berjam-jam di belakang job yang sedang menunggu window.
+      const checked = await drainEligibilityQueue({
+        workerId: CONFIG.WORKER_ID,
+      });
+
       const job = await claimNextJob();
 
       if (job) {
         idleTicks = 0;
         await processJob(job);
+      } else if (checked > 0) {
+        // Baru saja memproses check — jangan tidur penuh, mungkin ada
+        // pengecekan lain yang menyusul.
+        idleTicks = 0;
+        await sleep(500);
       } else {
         idleTicks++;
         // Heartbeat tiap ~5 menit biar kelihatan worker masih hidup di pm2 logs
         if (idleTicks % Math.max(1, Math.floor(300000 / CONFIG.POLL_INTERVAL_MS)) === 0) {
           console.log(`  [${ts()}] idle, menunggu job…`);
           await releaseStuckJobs();
+          // Bersihkan hasil check basi + session SIWE kedaluwarsa. Hasil check
+          // lama tidak berguna (allowlist bisa berubah) dan cuma menumpuk.
+          try {
+            await supabase.rpc("aco_prune_elig_checks");
+          } catch {
+            /* fungsi mungkin belum ada kalau migration belum dijalankan */
+          }
         }
         await sleep(CONFIG.POLL_INTERVAL_MS);
       }

@@ -41,6 +41,39 @@ export function assertEncryptionKeyReady() {
   return true;
 }
 
+/**
+ * Enkripsi teks dengan format yang sama seperti website.
+ *
+ * Worker awalnya hanya perlu DEKRIPSI (private key dienkripsi di website).
+ * Enkripsi ditambahkan karena cache session SIWE disimpan dari sisi worker —
+ * cookie itu berisi access_token JWT, setara sesi login penuh, jadi tidak boleh
+ * ditulis plaintext ke database.
+ *
+ * Nama fungsinya dibuat sama dengan versi website supaya kedua file tetap
+ * gampang dibandingkan kalau formatnya perlu diubah.
+ */
+export function encryptPrivateKey(plaintext) {
+  if (!plaintext || typeof plaintext !== "string") {
+    throw new Error("Tidak ada data untuk dienkripsi.");
+  }
+
+  // IV 12 byte: ukuran yang direkomendasikan untuk GCM.
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv(ALGO, getKey(), iv);
+
+  const ciphertext = Buffer.concat([
+    cipher.update(plaintext, "utf8"),
+    cipher.final(),
+  ]);
+
+  return [
+    VERSION,
+    iv.toString("base64"),
+    cipher.getAuthTag().toString("base64"),
+    ciphertext.toString("base64"),
+  ].join(":");
+}
+
 export function decryptPrivateKey(stored) {
   if (!stored || typeof stored !== "string") {
     throw new Error("Data terenkripsi kosong.");

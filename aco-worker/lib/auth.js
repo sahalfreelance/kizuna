@@ -103,12 +103,32 @@ async function verifySiwe(fields, signature, apiKey) {
   const text = await res.text();
   if (!res.ok) throw new Error(`verifySiwe failed: ${res.status} ${text}`);
 
+  // PENTING — sumber bug yang bikin "No access_token in response cookies":
+  //
+  // Versi CLI pakai node-fetch, yang punya `res.headers.raw()`. Setelah
+  // node-fetch diganti fetch bawaan Node (undici) lewat limitedFetch, method
+  // itu TIDAK ADA lagi, jadi kode jatuh ke `headers.get("set-cookie")`.
+  //
+  // Masalahnya: OpenSea mengirim BEBERAPA header Set-Cookie (access_token,
+  // refresh_token, auth_hint, ...). `headers.get()` menggabungkannya jadi satu
+  // string dipisah ", " — dan parser di bawah cuma mengambil pasangan pertama
+  // (`__cf_bm`), sehingga access_token tidak pernah terbaca dan login selalu
+  // dianggap gagal padahal server membalas 200.
+  //
+  // Perbaikannya: pakai `getSetCookie()` (standar WHATWG, ada di undici) yang
+  // mengembalikan ARRAY berisi tiap header Set-Cookie secara terpisah.
   let rawCookies = [];
-  if (typeof res.headers.raw === "function") {
+  if (typeof res.headers.getSetCookie === "function") {
+    rawCookies = res.headers.getSetCookie();
+  } else if (typeof res.headers.raw === "function") {
+    // node-fetch (kalau suatu saat dipakai lagi)
     rawCookies = res.headers.raw()["set-cookie"] || [];
   } else {
+    // Cadangan terakhir: pisah manual. Tidak bisa asal split(",") karena
+    // atribut Expires mengandung koma ("Expires=Fri, 28 Aug 2026 ..."), jadi
+    // dipisah hanya di koma yang diikuti "nama=".
     const single = res.headers.get("set-cookie");
-    if (single) rawCookies = [single];
+    if (single) rawCookies = single.split(/,\s*(?=[^=;,\s]+=)/);
   }
 
   const cookieMap = {};
@@ -122,7 +142,10 @@ async function verifySiwe(fields, signature, apiKey) {
   }
 
   if (!cookieMap["access_token"]) {
-    throw new Error("No access_token in response cookies — auth failed");
+    throw new Error(
+      "No access_token in response cookies — auth failed. " +
+        `Cookie yang terbaca: ${Object.keys(cookieMap).join(", ") || "(tidak ada)"}`
+    );
   }
 
   return cookieMap;
