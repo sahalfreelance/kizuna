@@ -112,6 +112,21 @@ export const SUPPORTED_CHAINS = [
     explorer: "https://explorer.inkonchain.com",
     defaultRpc: "https://rpc-gel.inkonchain.com",
   },
+  {
+    // Terverifikasi dari GET https://api.opensea.io/api/v2/chains:
+    // { "chain": "robinhood", "name": "Robinhood Chain", "symbol": "ETH",
+    //   "supports_swaps": true,
+    //   "block_explorer_url": "https://robinhoodchain.blockscout.com" }
+    //
+    // chainId 4663 dari chainid.network (L2 di atas Ethereum, via Arbitrum
+    // Orbit). RPC di bawah sudah diuji: chainId 4663 terkonfirmasi, 139ms.
+    identifier: "robinhood",
+    chainId: 4663,
+    label: "Robinhood",
+    symbol: "ETH",
+    explorer: "https://robinhoodchain.blockscout.com",
+    defaultRpc: "https://robinhood-rpc.publicnode.com",
+  },
 ];
 
 const BY_IDENTIFIER = new Map(SUPPORTED_CHAINS.map((c) => [c.identifier, c]));

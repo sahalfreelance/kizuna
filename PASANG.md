@@ -4,8 +4,8 @@ Semua hasil kerja dalam satu paket: **login username+password**, **ACO
 multi-platform**, **worker VPS**. Struktur foldernya sudah sama dengan repo,
 jadi tinggal di-copy.
 
-Kalau lu sudah memasang patch 1–4 sebelumnya, paket ini **menggantikan
-semuanya** — aman ditimpa.
+Kalau lu sudah memasang patch sebelumnya, paket ini **menggantikan semuanya** —
+aman ditimpa.
 
 ---
 
@@ -97,7 +97,6 @@ where table_name in ('app_users','app_login_events','aco_wallets','aco_jobs',
                      'aco_attempts');
 -- harus 9 baris
 
-select unnest(enum_range(null::text)) is null;  -- abaikan
 select conname, pg_get_constraintdef(oid) from pg_constraint
 where conname = 'aco_jobs_platform_check';
 -- harus memuat: opensea, mintbay, scatter, contract
@@ -150,7 +149,7 @@ cd ~/kizuna/bot && node deploy-commands.js
 
 # uji worker sebelum start
 cd ~/kizuna/aco-worker
-node check-rpc.js        # harus 12/12
+node check-rpc.js        # harus 13/13
 node worker.js --check   # harus lolos semua
 
 # start
@@ -175,9 +174,13 @@ channel), `/change-password`, `/reset-device`, `/my-account`.
 **Scatter** `SOON` · **Mint by Contract** `SOON`. Wallet, API key, dan RPC
 dipakai bersama semua platform — nanti tidak perlu import wallet ulang.
 
-**12 chain**, dideteksi otomatis dari slug OpenSea. Chain tidak bisa dipilih
-manual: kalau bisa, ada peluang salah pasang dan tx dikirim ke jaringan yang
-salah.
+**13 chain**, dideteksi otomatis dari slug OpenSea — termasuk **Robinhood Chain**
+(chainId 4663). Chain tidak bisa dipilih manual: kalau bisa, ada peluang salah
+pasang dan tx dikirim ke jaringan yang salah.
+
+**Maksimal 2 wallet per akun.** Saat bikin job, wallet dipilih bebas: satu, dua,
+atau keduanya untuk mint bersamaan (paralel). Batas ditegakkan di server, bukan
+cuma di UI.
 
 **Custom RPC per chain** + fallback berlapis. RPC dienkripsi (URL Alchemy/Infura
 mengandung API key). Worker memverifikasi chain id RPC sebelum mint.
@@ -205,10 +208,12 @@ Gw **tidak menyentuh database lu dan tidak mengirim transaksi apa pun.**
 Belum teruji tanpa DB asli + wallet berisi ETH:
 - alur penuh job `QUEUED` → tx terkirim
 - pencatatan `aco_attempts` saat retry sungguhan
+- penolakan wallet ke-3 oleh server (butuh 2 wallet tersimpan lebih dulu)
+- mint di Robinhood Chain (RPC + chainId sudah terverifikasi, mint-nya belum)
 - pembuatan API key OpenSea dengan respons sukses (kuota IP VPS ini habis)
 
 Modul-modulnya sudah diuji terpisah terhadap mainnet asli — RPC failover,
 anti-revert (revert reason `require(false)` berhasil didecode), rate limiter,
-klasifikasi 12 jenis error.
+klasifikasi 12 jenis error, dan 13/13 RPC chain.
 
 Tes pertama: satu wallet burner, stage gratis/murah, `max_attempts=2`.

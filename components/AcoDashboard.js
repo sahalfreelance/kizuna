@@ -365,12 +365,15 @@ function countdown(iso) {
 
 /* ======================================================== WALLET MANAGER */
 
-function WalletManager({ wallets, onChange }) {
+function WalletManager({ wallets, limit, onChange }) {
   const [privateKey, setPrivateKey] = useState("");
   const [walletLabel, setWalletLabel] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const [showForm, setShowForm] = useState(false);
+
+  const maxWallets = limit ?? 2;
+  const full = wallets.length >= maxWallets;
 
   async function importWallet(e) {
     e.preventDefault();
@@ -413,14 +416,27 @@ function WalletManager({ wallets, onChange }) {
     <div style={panel}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
         <h2 style={{ fontSize: 13, fontWeight: 700, letterSpacing: 0.8, color: "var(--text)" }}>
-          WALLETS <span style={{ color: "var(--text-dim)", fontWeight: 400 }}>({wallets.length})</span>
+          WALLETS{" "}
+          <span style={{ color: full ? "var(--live)" : "var(--text-dim)", fontWeight: 400 }}>
+            ({wallets.length}/{maxWallets})
+          </span>
         </h2>
-        <button onClick={() => setShowForm((v) => !v)} style={btn("ghost")}>
-          {showForm ? "tutup" : "+ import"}
-        </button>
+        {/* Tombol import disembunyikan kalau kuota penuh — kalau ditampilkan
+            lalu ditolak server, user cuma kebingungan. */}
+        {!full && (
+          <button onClick={() => setShowForm((v) => !v)} style={btn("ghost")}>
+            {showForm ? "tutup" : "+ import"}
+          </button>
+        )}
       </div>
 
-      {showForm && (
+      {full && (
+        <p style={{ fontSize: 10.5, color: "var(--text-dim)", lineHeight: 1.7, marginBottom: 10 }}>
+          Kuota wallet penuh (maks {maxWallets}). Hapus salah satu dulu kalau mau ganti.
+        </p>
+      )}
+
+      {showForm && !full && (
         <>
           {/* Peringatan ditaruh DI ATAS form, bukan di bawah — supaya dibaca
               sebelum orang menempel private key, bukan sesudah. */}
@@ -807,36 +823,92 @@ function JobCreator({ wallets, chains, platform, onCreated }) {
                 </div>
               </div>
 
-              <label style={label}>WALLET YANG DIPAKAI ({selected.length} dipilih)</label>
+              <label style={label}>
+                WALLET YANG DIPAKAI ({selected.length}/{wallets.length} dipilih)
+              </label>
               {wallets.length === 0 ? (
                 <p style={{ fontSize: 11, color: "var(--live)", marginBottom: 12 }}>
                   Import wallet dulu di panel sebelah.
                 </p>
               ) : (
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginBottom: 14 }}>
-                  {wallets.map((w) => {
-                    const on = selected.includes(w.id);
-                    return (
+                <>
+                  {/* Wallet dipilih bebas: bisa satu, bisa dua, bisa keduanya
+                      untuk mint bersamaan. Tombol pilih semua / kosongkan cuma
+                      ditampilkan kalau ada lebih dari satu wallet. */}
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginBottom: 8 }}>
+                    {wallets.map((w) => {
+                      const on = selected.includes(w.id);
+                      return (
+                        <button
+                          key={w.id}
+                          type="button"
+                          onClick={() => toggleWallet(w.id)}
+                          style={{
+                            fontSize: 10.5,
+                            background: on ? "var(--indigo)" : "transparent",
+                            color: on ? "#fff" : "var(--text-dim)",
+                            border: `1px solid ${on ? "var(--indigo)" : "var(--border)"}`,
+                            borderRadius: 3,
+                            padding: "5px 10px",
+                            cursor: "pointer",
+                            fontFamily: "var(--font-mono)",
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 5,
+                          }}
+                        >
+                          <span style={{ fontSize: 9 }}>{on ? "◉" : "○"}</span>
+                          {w.label || short(w.address)}
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {wallets.length > 1 && (
+                    <div style={{ display: "flex", gap: 8, marginBottom: 12, alignItems: "center" }}>
                       <button
-                        key={w.id}
                         type="button"
-                        onClick={() => toggleWallet(w.id)}
+                        onClick={() => setSelected(wallets.map((w) => w.id))}
                         style={{
-                          fontSize: 10.5,
-                          background: on ? "var(--indigo)" : "transparent",
-                          color: on ? "#fff" : "var(--text-dim)",
-                          border: `1px solid ${on ? "var(--indigo)" : "var(--border)"}`,
-                          borderRadius: 3,
-                          padding: "4px 8px",
+                          background: "transparent",
+                          border: "none",
+                          color: "var(--indigo-dim)",
                           cursor: "pointer",
+                          fontSize: 10,
                           fontFamily: "var(--font-mono)",
+                          padding: 0,
                         }}
                       >
-                        {w.label || short(w.address)}
+                        pakai semua ({wallets.length})
                       </button>
-                    );
-                  })}
-                </div>
+                      <span style={{ color: "var(--border)" }}>|</span>
+                      <button
+                        type="button"
+                        onClick={() => setSelected([])}
+                        style={{
+                          background: "transparent",
+                          border: "none",
+                          color: "var(--text-dim)",
+                          cursor: "pointer",
+                          fontSize: 10,
+                          fontFamily: "var(--font-mono)",
+                          padding: 0,
+                        }}
+                      >
+                        kosongkan
+                      </button>
+                      <span style={{ marginLeft: "auto", fontSize: 9.5, color: "var(--text-dim)" }}>
+                        {selected.length === wallets.length
+                          ? "mint bersamaan (paralel)"
+                          : selected.length === 1
+                          ? "mint 1 wallet"
+                          : selected.length === 0
+                          ? "belum ada yang dipilih"
+                          : `mint ${selected.length} wallet`}
+                      </span>
+                    </div>
+                  )}
+                </>
               )}
 
               <label style={label}>PENGAMAN</label>
@@ -1127,6 +1199,7 @@ function JobDetail({ jobId, onClose, onChanged }) {
                       : job.chain === "ape_chain" ? `https://apescan.io/tx/${r.txHash}`
                       : job.chain === "ronin" ? `https://app.roninchain.com/tx/${r.txHash}`
                       : job.chain === "ink" ? `https://explorer.inkonchain.com/tx/${r.txHash}`
+                      : job.chain === "robinhood" ? `https://robinhoodchain.blockscout.com/tx/${r.txHash}`
                       : `https://etherscan.io/tx/${r.txHash}`
                     }
                     target="_blank"
@@ -1281,6 +1354,7 @@ function JobDetail({ jobId, onClose, onChanged }) {
 
 export default function AcoDashboard() {
   const [wallets, setWallets] = useState([]);
+  const [walletLimit, setWalletLimit] = useState(2);
   const [chains, setChains] = useState([]);
   const [platforms, setPlatforms] = useState([]);
   const [activePlatform, setActivePlatform] = useState("opensea");
@@ -1293,6 +1367,9 @@ export default function AcoDashboard() {
     if (res.ok) {
       const json = await res.json();
       setWallets(json.data || []);
+      // Batas wallet datang dari server, bukan hardcode di UI — kalau nanti
+      // diubah di API, UI ikut sendiri.
+      if (json.limit) setWalletLimit(json.limit);
     }
   }, []);
 
@@ -1357,7 +1434,7 @@ export default function AcoDashboard() {
             <span style={{ color: "var(--indigo-dim)" }}>~/</span>aco
           </h1>
           <span style={{ fontSize: 11, color: "var(--text-dim)" }}>
-            {wallets.length} wallet · {chains.length} chain · {activeCount} job aktif
+            {wallets.length}/{walletLimit} wallet · {chains.length} chain · {activeCount} job aktif
           </span>
         </div>
         <p style={{ fontSize: 11, color: "var(--text-dim)", marginTop: 4, lineHeight: 1.7 }}>
@@ -1420,7 +1497,7 @@ export default function AcoDashboard() {
         }}
       >
         <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-          <WalletManager wallets={wallets} onChange={loadWallets} />
+          <WalletManager wallets={wallets} limit={walletLimit} onChange={loadWallets} />
           <OpenseaKeyPanel />
           <RpcManager chains={chains} onChange={loadChains} />
         </div>

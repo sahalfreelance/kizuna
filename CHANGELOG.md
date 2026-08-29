@@ -84,7 +84,7 @@ kehabisan file descriptor. Ditambah `provider.destroy()` di `finally`.
 
 ## 3. Multi-chain + custom RPC
 
-12 chain, RPC default tiap chain diverifikasi: **12/12 OK**.
+RPC default tiap chain diverifikasi langsung.
 
 Chain **dideteksi otomatis** dari OpenSea, tidak dipilih user — menghilangkan
 kelas kesalahan "tx dikirim ke jaringan salah".
@@ -186,6 +186,40 @@ perlu migration baru dari nol.
 
 ---
 
+## 7. Robinhood Chain + batas 2 wallet
+
+**Robinhood Chain.** Dikonfirmasi dulu dari sumbernya, bukan diasumsikan:
+
+```
+GET https://api.opensea.io/api/v2/chains
+→ { "chain": "robinhood", "name": "Robinhood Chain", "symbol": "ETH",
+    "supports_swaps": true,
+    "block_explorer_url": "https://robinhoodchain.blockscout.com" }
+```
+
+`chainId` 4663 dari chainid.network (L2 di atas Ethereum via Arbitrum Orbit).
+RPC diuji: `robinhood-rpc.publicnode.com` → chainId 4663, 103ms.
+
+`identifier` harus **persis** `"robinhood"` seperti yang dipakai OpenSea — kalau
+beda, deteksi chain dari slug akan menganggapnya tidak didukung. Diverifikasi
+13/13 identifier registry cocok dengan daftar OpenSea.
+
+RPC alternatif `rpc.arrowrpc.com` gagal (HTTP 530), tidak dipakai.
+
+**Batas 2 wallet.** `MAX_WALLETS_PER_USER` diturunkan dari 20 → 2. Ditegakkan di
+API (server), bukan cuma di UI — UI yang tombolnya disembunyikan masih bisa
+diakali lewat curl.
+
+Batas dikirim server ke UI lewat field `limit` di response `GET
+/api/aco/wallets`, jadi kalau nanti diubah di API, UI ikut sendiri tanpa perlu
+diedit.
+
+Pemilihan wallet saat bikin job: bebas satu, dua, atau keduanya. Ditambah radio
+indicator (◉/○), tombol "pakai semua" / "kosongkan", dan keterangan hidup —
+"mint bersamaan (paralel)" saat dua-duanya dipilih, "mint 1 wallet" saat satu.
+
+---
+
 ## Hasil tes
 
 ```
@@ -217,8 +251,16 @@ enkripsi wallet
 auth
   12 skenario (redirect, device mismatch, token rusak, expired) ✓
 
-registry vs constraint SQL  COCOK ✓
-endpoint tanpa auth         semua 401 ✓
-check-rpc                   12/12 chain ✓
-build                       ✓ Compiled successfully
+chain
+  check-rpc 13/13 chain OK ✓
+  Robinhood chainId 4663 terkonfirmasi ✓
+  13/13 identifier cocok dengan daftar OpenSea ✓
+  registry website vs worker IDENTIK ✓
+
+platform
+  registry vs constraint SQL COCOK ✓
+  scatter/mintbay/contract ditolak API ✓
+
+endpoint tanpa auth       semua 401 ✓
+build                     ✓ Compiled successfully
 ```

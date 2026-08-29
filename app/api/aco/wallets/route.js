@@ -4,7 +4,14 @@ import { getAuthContext, buildDenial } from "@/lib/apiAuth";
 import { supabaseAdmin } from "@/lib/supabase";
 import { encryptPrivateKey, normalizePrivateKey } from "@/lib/walletCrypto";
 
-const MAX_WALLETS_PER_USER = 20;
+// Batas 2 wallet per akun. Dipilih sengaja, bukan angka acak: tiap wallet
+// perlu login SIWE sendiri sebelum mint, jadi makin banyak wallet makin lama
+// persiapannya dan makin besar risiko kena rate limit di detik-detik kritis.
+// Dua wallet cukup untuk mint paralel tanpa memperlambat.
+//
+// Batas ini ditegakkan di SINI (server), bukan cuma di UI — UI yang dimatikan
+// tombolnya masih bisa diakali lewat curl.
+export const MAX_WALLETS_PER_USER = 2;
 
 /**
  * GET /api/aco/wallets
@@ -28,7 +35,11 @@ export async function GET(req) {
     return NextResponse.json({ error: "Gagal ambil daftar wallet." }, { status: 500 });
   }
 
-  return NextResponse.json({ data });
+  return NextResponse.json({
+    data,
+    // Dipakai UI untuk menyembunyikan form import saat kuota penuh.
+    limit: MAX_WALLETS_PER_USER,
+  });
 }
 
 /**
@@ -78,7 +89,11 @@ export async function POST(req) {
 
   if ((count ?? 0) >= MAX_WALLETS_PER_USER) {
     return NextResponse.json(
-      { error: `Maksimal ${MAX_WALLETS_PER_USER} wallet per akun.` },
+      {
+        error: `Maksimal ${MAX_WALLETS_PER_USER} wallet per akun. Hapus salah satu dulu kalau mau ganti.`,
+        code: "WALLET_LIMIT",
+        limit: MAX_WALLETS_PER_USER,
+      },
       { status: 400 }
     );
   }
