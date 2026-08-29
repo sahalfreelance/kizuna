@@ -745,11 +745,12 @@ function JobCreator({ wallets, chains, platform, onCreated }) {
 
       const checkId = json.data.id;
 
-      // Polling maksimal ~40 detik. Worker biasanya selesai dalam 2-6 detik
-      // (2 wallet x SIWE login), tapi kalau worker mati kita harus berhenti
-      // daripada polling selamanya.
-      for (let i = 0; i < 40; i++) {
-        await new Promise((r) => setTimeout(r, 1000));
+      // Polling cepat (400ms) selama ~30 detik. Worker biasanya selesai dalam
+      // 1-3 detik kalau session sudah hangat. Interval 1 detik membuat hasil
+      // yang siap dalam 1,2s terasa 2s — untuk alat yang tujuannya cepat, itu
+      // sia-sia.
+      for (let i = 0; i < 75; i++) {
+        await new Promise((r) => setTimeout(r, i === 0 ? 250 : 400));
 
         const pRes = await fetch(`/api/aco/eligibility?id=${checkId}`, {
           cache: "no-store",
@@ -774,7 +775,8 @@ function JobCreator({ wallets, chains, platform, onCreated }) {
 
       setEligState("timeout");
       setEligError(
-        "Worker belum merespons. Cek worker di VPS jalan atau tidak (pm2 logs kizuna-aco-worker)."
+        "Worker belum merespons dalam 30 detik. Cek worker di VPS jalan atau tidak " +
+          "(pm2 logs kizuna-aco-worker)."
       );
     } catch {
       setEligState("error");
@@ -952,13 +954,14 @@ function JobCreator({ wallets, chains, platform, onCreated }) {
               <span style={{ color: "var(--text-dim)" }}>ELIGIBILITY</span>
               {eligState === "checking" && (
                 <span style={{ color: "var(--live)" }}>
-                  cek wallet di worker… (SIWE login ~2-4s)
+                  cek wallet di worker…
                 </span>
               )}
               {eligState === "done" && (
                 <>
                   <span style={{ color: "var(--crypto)" }}>
                     {elig?.totalWallets ?? 0} wallet dicek
+                    {elig?.durationMs ? ` · ${(elig.durationMs / 1000).toFixed(1)}s` : ""}
                   </span>
                   {elig?.wallets?.some((w) => !w.ok) && (
                     <span style={{ color: "#f87171", fontSize: 10 }}>

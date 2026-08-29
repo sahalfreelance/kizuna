@@ -40,6 +40,47 @@ async function claimCheck(workerId) {
   return data;
 }
 
+/**
+ * Prewarm session SIWE untuk semua wallet user.
+ *
+ * Dipanggil SEBELUM pengecekan eligibility supaya login dua wallet terjadi
+ * PARALEL, bukan berurutan. Login sequential 2 wallet = ~4-5 detik; paralel
+ * = ~2 detik. Untuk checker yang ditunggu user di depan layar, itu selisih
+ * yang terasa.
+ *
+ * Kenapa boleh paralel di sini padahal login mint sequential: yang membuat
+ * opensea.io kena 429 adalah BANYAK wallet (5+). Dua wallet aman, dan
+ * rateLimiter tetap memberi jeda otomatis kalau ternyata kena.
+ */
+async function prewarmSessions(wallets, apiKey, { log = null } = {}) {
+  const t0 = Date.now();
+
+  const settled = await Promise.allSettled(
+    wallets.map((w) =>
+      getSiweSession(
+        {
+          walletId: w.id,
+          address: w.address,
+          privateKey: w.privateKey,
+          chainId: 1,
+          apiKey,
+        },
+        { log }
+      ).then((cookieStr) => ({ walletId: w.id, cookieStr }))
+    )
+  );
+
+  const map = new Map();
+  for (const r of settled) {
+    if (r.status === "fulfilled") map.set(r.value.walletId, r.value.cookieStr);
+  }
+
+  console.log(
+    `  [elig] session siap ${map.size}/${wallets.length} wallet dalam ${Date.now() - t0}ms`
+  );
+  return map;
+}
+
 export async function processEligibilityCheck(check, { workerId, log = null }) {
   const t0 = Date.now();
   const say = (msg) => console.log(`  [elig ${check.id.slice(0, 8)}] ${msg}`);
@@ -71,21 +112,18 @@ export async function processEligibilityCheck(check, { workerId, log = null }) {
 
     say(`cek ${walletRows.length} wallet terhadap "${check.slug}"`);
 
-    const walletResults = [];
-    let collection = null;
+    // Dekripsi semua wallet dulu, sekalian validasi address.
+    const wallets = [];
+    const failed = [];
 
-    // Sequential, bukan paralel: opensea.io gampang kena 429 kalau beberapa
-    // login SIWE ditembak berbarengan, dan wallet cuma 2 jadi tidak lama.
     for (const row of walletRows) {
       const label = row.label || `${row.address.slice(0, 6)}…${row.address.slice(-4)}`;
-
       try {
         const privateKey = decryptPrivateKey(row.encrypted_key);
-
-        // Pengaman: address hasil dekripsi harus cocok dengan yang tercatat.
         const derived = new ethers.Wallet(privateKey).address;
+
         if (derived.toLowerCase() !== row.address.toLowerCase()) {
-          walletResults.push({
+          failed.push({
             walletId: row.id,
             address: row.address,
             label,
@@ -96,44 +134,9 @@ export async function processEligibilityCheck(check, { workerId, log = null }) {
           continue;
         }
 
-        let cookieStr = await getSiweSession(
-          { walletId: row.id, address: derived, privateKey, chainId: 1, apiKey },
-          { log }
-        );
-
-        let result;
-        try {
-          result = await checkWalletEligibility(cookieStr, derived, check.slug);
-        } catch (err) {
-          // Session ditolak: buang cache, login ulang, coba SEKALI lagi.
-          if (err.needsRelogin) {
-            say(`session ${label} ditolak, login ulang`);
-            await invalidateSiweSession(row.id);
-            cookieStr = await getSiweSession(
-              { walletId: row.id, address: derived, privateKey, chainId: 1, apiKey },
-              { forceRelogin: true, log }
-            );
-            result = await checkWalletEligibility(cookieStr, derived, check.slug);
-          } else {
-            throw err;
-          }
-        }
-
-        if (result.collection) collection = result.collection;
-
-        walletResults.push({
-          walletId: row.id,
-          address: derived,
-          label,
-          ok: result.ok,
-          error: result.error ?? null,
-          stages: result.stages ?? [],
-        });
-
-        const eligCount = (result.stages ?? []).filter((s) => s.eligible === true).length;
-        say(`${label}: ${result.ok ? `${eligCount} stage eligible` : result.error}`);
+        wallets.push({ id: row.id, address: derived, privateKey, label });
       } catch (err) {
-        walletResults.push({
+        failed.push({
           walletId: row.id,
           address: row.address,
           label,
@@ -141,8 +144,81 @@ export async function processEligibilityCheck(check, { workerId, log = null }) {
           error: String(err.message).slice(0, 250),
           stages: [],
         });
-        say(`${label}: ERROR ${String(err.message).slice(0, 120)}`);
       }
+    }
+
+    // Login PARALEL — ini bagian paling lambat, jadi tidak boleh sequential.
+    const sessionMap = await prewarmSessions(wallets, apiKey, { log });
+
+    // Query eligibility juga PARALEL. Ini cuma 1 request per wallet dan
+    // rateLimiter sudah menjaga lajunya.
+    const settled = await Promise.allSettled(
+      wallets.map(async (w) => {
+        let cookieStr = sessionMap.get(w.id);
+        if (!cookieStr) {
+          // Login saat prewarm gagal — coba sekali lagi di sini.
+          cookieStr = await getSiweSession(
+            { walletId: w.id, address: w.address, privateKey: w.privateKey, chainId: 1, apiKey },
+            { forceRelogin: true, log }
+          );
+        }
+
+        let result;
+        try {
+          result = await checkWalletEligibility(cookieStr, w.address, check.slug);
+        } catch (err) {
+          // Session ditolak: buang cache, login ulang, coba SEKALI lagi.
+          if (err.needsRelogin) {
+            say(`session ${w.label} ditolak, login ulang`);
+            await invalidateSiweSession(w.id);
+            cookieStr = await getSiweSession(
+              { walletId: w.id, address: w.address, privateKey: w.privateKey, chainId: 1, apiKey },
+              { forceRelogin: true, log }
+            );
+            result = await checkWalletEligibility(cookieStr, w.address, check.slug);
+          } else {
+            throw err;
+          }
+        }
+
+        return { wallet: w, result };
+      })
+    );
+
+    const walletResults = [...failed];
+    let collection = null;
+
+    for (let i = 0; i < settled.length; i++) {
+      const w = wallets[i];
+      const s = settled[i];
+
+      if (s.status === "rejected") {
+        walletResults.push({
+          walletId: w.id,
+          address: w.address,
+          label: w.label,
+          ok: false,
+          error: String(s.reason?.message ?? s.reason).slice(0, 250),
+          stages: [],
+        });
+        say(`${w.label}: ERROR ${String(s.reason?.message ?? s.reason).slice(0, 120)}`);
+        continue;
+      }
+
+      const { result } = s.value;
+      if (result.collection) collection = result.collection;
+
+      walletResults.push({
+        walletId: w.id,
+        address: w.address,
+        label: w.label,
+        ok: result.ok,
+        error: result.error ?? null,
+        stages: result.stages ?? [],
+      });
+
+      const eligCount = (result.stages ?? []).filter((x) => x.eligible === true).length;
+      say(`${w.label}: ${result.ok ? `${eligCount} stage eligible` : result.error}`);
     }
 
     const stages = summarizeStages(walletResults);

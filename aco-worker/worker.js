@@ -10,7 +10,7 @@ import { RpcPool } from "./lib/rpcPool.js";
 import { statsSnapshot } from "./lib/rateLimiter.js";
 import { mintWalletGuarded } from "./lib/mintGuarded.js";
 import { drainEligibilityQueue } from "./lib/eligWorker.js";
-import { siweLogin } from "./lib/auth.js";
+import { getSiweSession } from "./lib/siweSession.js";
 import { fetchDropInfo } from "./lib/graphql.js";
 
 /**
@@ -34,12 +34,25 @@ const CONFIG = {
   // defaultRpc sendiri.
   RPC_URL: process.env.RPC_URL || null,
   POLL_INTERVAL_MS: parseInt(process.env.POLL_INTERVAL_MS) || 5000,
+  // Antrean eligibility check dicek jauh lebih sering daripada job mint.
+  // Alasannya user menunggu di depan layar: kalau ikut polling 5 detik, hasil
+  // yang komputasinya cuma ~1 detik jadi terasa 6 detik.
+  ELIG_POLL_MS: parseInt(process.env.ELIG_POLL_MS) || 700,
   WORKER_ID: process.env.WORKER_ID || `worker-${process.pid}`,
-  // Job yang stage-nya sudah lewat lebih dari ini dianggap kedaluwarsa.
-  MAX_LATE_MS: parseInt(process.env.MAX_LATE_MS) || 5 * 60 * 1000,
 };
 
-const WORKER_VERSION = "v3";
+// CATATAN: MAX_LATE_MS sudah DIHAPUS. Dulu job digagalkan kalau waktu buka
+// stage sudah lewat lebih dari nilai itu — ternyata salah, karena selama stage
+// masih OPEN mint tetap bisa dieksekusi. Sekarang yang menentukan adalah waktu
+// TUTUP stage. Kalau env MAX_LATE_MS masih ada di .env, diabaikan saja.
+
+const WORKER_VERSION = "v4";
+
+// SIWE login memakan ~2 detik per wallet. Untuk mint yang menang-kalahnya
+// hitungan detik, itu mahal. Session dipanaskan lebih awal: dimulai
+// PREHEAT_BEFORE_MS sebelum window buka, jadi saat detik nol tiba cookie sudah
+// siap di memori dan tidak ada login yang menahan.
+const PREHEAT_BEFORE_MS = 90 * 1000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const ts = () => new Date().toISOString().replace("T", " ").slice(0, 19) + " UTC";
@@ -151,9 +164,27 @@ async function loginWallets(wallets, chainId, apiKey, userId, log, opts = {}) {
 
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-          const cookieStr = await siweLogin(w.privateKey, chainId, null, apiKey);
-          sessions.push({ wallet: w.signer, address: w.address, cookieStr });
-          await log.ok("Login OpenSea berhasil", w.address);
+          // Pakai session dari cache kalau ada. Eligibility check biasanya
+          // sudah login untuk wallet ini beberapa menit sebelumnya, jadi di
+          // detik-detik kritis mint kita hemat ~2 detik per wallet.
+          const cookieStr = await getSiweSession(
+            {
+              walletId: w.id,
+              address: w.address,
+              privateKey: w.privateKey,
+              chainId,
+              apiKey,
+            },
+            { forceRelogin: attempt > 1, log }
+          );
+
+          sessions.push({
+            address: w.address,
+            cookieStr,
+            signerFor: w.signerFor,
+            walletId: w.id,
+          });
+          await log.ok("Login OpenSea siap", w.address);
           ok = true;
           break;
         } catch (err) {
@@ -196,14 +227,26 @@ async function loginWallets(wallets, chainId, apiKey, userId, log, opts = {}) {
  * Selama menunggu, status pembatalan dicek berkala supaya job yang
  * dibatalkan user tidak tetap jalan.
  */
-async function waitForWindow(startTimeISO, jobId, log) {
+async function waitForWindow(startTimeISO, jobId, log, onPreheat = null) {
   const startTs = Math.floor(new Date(startTimeISO).getTime() / 1000);
+  let preheated = false;
 
   while (true) {
     if (await isCancelled(jobId)) return null;
 
     const now = Math.floor(Date.now() / 1000);
     const remaining = startTs - now;
+
+    // Pemanasan session: dijalankan SEBELUM detik nol supaya SIWE login (~2s
+    // per wallet) tidak memakan waktu di saat yang paling menentukan.
+    if (!preheated && onPreheat && remaining * 1000 <= PREHEAT_BEFORE_MS) {
+      preheated = true;
+      try {
+        await onPreheat(remaining);
+      } catch (err) {
+        await log.warn(`Pemanasan session gagal: ${err.message}`);
+      }
+    }
 
     if (remaining <= 10) {
       await log.info(`Mint window hampir buka (${remaining}s), pemanasan…`);
@@ -365,6 +408,7 @@ async function processJob(job) {
         }
 
         wallets.push({
+          id: row.id,
           address: base.address,
           privateKey,
           // Dipakai RpcPool.sendOnce untuk mengikat signer ke provider aktif.
@@ -402,6 +446,9 @@ async function processJob(job) {
     // chain berbeda itu kondisi ganjil yang lebih aman digagalkan.
     let contractAddress = job.contract_address;
     let startTimeISO = job.stage_start_time;
+    let endTimeISO = job.stage_end_time || null;
+    // Diset true kalau waktu buka sudah lewat — tidak perlu menunggu window.
+    let skipWait = false;
 
     try {
       const drop = await fetchDropInfo(job.slug, sessions[0].cookieStr);
@@ -425,6 +472,12 @@ async function processJob(job) {
         );
         startTimeISO = stage.startTime;
       }
+
+      // Waktu TUTUP juga di-refresh — ini yang menentukan job masih boleh jalan
+      // atau tidak, jadi datanya harus yang terbaru.
+      if (stage?.endTime && stage.endTime !== endTimeISO) {
+        endTimeISO = stage.endTime;
+      }
     } catch (err) {
       // Ketidakcocokan chain itu fatal, bukan sesuatu yang boleh dilewati.
       if (String(err.message).includes("Collection sekarang di chain")) throw err;
@@ -438,21 +491,95 @@ async function processJob(job) {
     const chain = job.chain;
     await log.info(`Contract ${contractAddress} · chain ${chain}`);
 
-    // Job yang jadwalnya sudah lewat jauh tidak usah dijalankan.
-    const lateBy = Date.now() - new Date(startTimeISO).getTime();
-    if (lateBy > CONFIG.MAX_LATE_MS) {
+    // ---- Boleh jalan atau tidak? ----------------------------------------
+    //
+    // PERBAIKAN dari versi sebelumnya: dulu job digagalkan kalau waktu BUKA
+    // sudah lewat lebih dari MAX_LATE_MS. Itu salah — selama stage-nya masih
+    // OPEN, mint masih bisa dieksekusi dan masih ada gunanya. Job yang dibuat
+    // terlambat (atau worker yang baru direstart) jadi gagal duluan padahal
+    // stage-nya masih buka berjam-jam.
+    //
+    // Sekarang yang menentukan adalah waktu TUTUP:
+    //   - stage sudah tutup            -> gagal (memang tidak ada gunanya)
+    //   - stage masih buka             -> JALAN, walau bukanya sudah lama lewat
+    //   - stage belum buka             -> tunggu (waitForWindow)
+    //   - tidak ada endTime            -> jalan, tapi beri peringatan
+    const nowMs = Date.now();
+    const startMs = new Date(startTimeISO).getTime();
+    const endMs = endTimeISO ? new Date(endTimeISO).getTime() : null;
+    const lateBy = nowMs - startMs;
+
+    if (endMs && nowMs >= endMs) {
+      const overBy = Math.round((nowMs - endMs) / 60000);
       throw new Error(
-        `Stage sudah lewat ${Math.round(lateBy / 60000)} menit — job kedaluwarsa`
+        `Stage sudah TUTUP ${overBy} menit lalu (${endTimeISO}) — tidak bisa mint lagi`
       );
+    }
+
+    if (lateBy > 0) {
+      // Sudah lewat waktu buka tapi stage masih hidup: lanjut, jangan gagal.
+      const lateLabel =
+        lateBy > 60000 ? `${Math.round(lateBy / 60000)} menit` : `${Math.round(lateBy / 1000)} detik`;
+
+      if (endMs) {
+        const leftMin = Math.round((endMs - nowMs) / 60000);
+        const leftLabel = leftMin >= 1 ? `${leftMin} menit` : "kurang dari 1 menit";
+        await log.warn(
+          `Waktu buka sudah lewat ${lateLabel}, tapi stage MASIH BUKA ` +
+            `(tutup dalam ${leftLabel}) — mint tetap dijalankan`
+        );
+      } else {
+        // Tanpa endTime kita tidak tahu kapan tutup. Tetap dicoba: kalau
+        // ternyata sudah tutup, preflight/simulasi yang akan menolaknya —
+        // dan itu tidak membakar gas.
+        await log.warn(
+          `Waktu buka sudah lewat ${lateLabel} dan OpenSea tidak memberi waktu ` +
+            `tutup — mint tetap dicoba, anti-revert yang akan menyaring`
+        );
+      }
+
+      // Job yang sudah lewat waktu buka TIDAK perlu menunggu window lagi.
+      skipWait = true;
     }
 
     // ---- 6. Tunggu window ----------------------------------------------
     await setJobStatus(job.id, { started_at: new Date().toISOString() });
 
-    const startTs = await waitForWindow(startTimeISO, job.id, log);
-    if (startTs === null) {
-      await log.warn("Job dibatalkan user, berhenti.");
-      return;
+    let startTs;
+    if (skipWait) {
+      // Stage sudah buka — langsung eksekusi, tidak ada gunanya menunggu.
+      startTs = Math.floor(new Date(startTimeISO).getTime() / 1000);
+      await log.info("Stage sudah buka — langsung mint tanpa menunggu");
+    } else {
+      startTs = await waitForWindow(startTimeISO, job.id, log, async (remaining) => {
+        // Panaskan session ~90 detik sebelum buka. Cookie dari eligibility
+        // check biasanya sudah ada, jadi ini biasanya cuma memastikan; kalau
+        // sudah kedaluwarsa, login terjadi SEKARANG, bukan di detik nol.
+        await log.info(`Memanaskan session (${remaining}s sebelum buka)…`);
+        let ready = 0;
+        for (const s of sessions) {
+          try {
+            s.cookieStr = await getSiweSession(
+              {
+                walletId: s.walletId,
+                address: s.address,
+                privateKey: wallets.find((w) => w.id === s.walletId)?.privateKey,
+                chainId,
+                apiKey,
+              },
+              { log }
+            );
+            ready++;
+          } catch (err) {
+            await log.warn(`Pemanasan gagal: ${err.message}`, s.address);
+          }
+        }
+        await log.ok(`Session siap: ${ready}/${sessions.length} wallet`);
+      });
+      if (startTs === null) {
+        await log.warn("Job dibatalkan user, berhenti.");
+        return;
+      }
     }
 
     // ---- 7. Mint semua wallet paralel -----------------------------------
@@ -668,11 +795,11 @@ async function main() {
         // Baru saja memproses check — jangan tidur penuh, mungkin ada
         // pengecekan lain yang menyusul.
         idleTicks = 0;
-        await sleep(500);
+        await sleep(200);
       } else {
         idleTicks++;
         // Heartbeat tiap ~5 menit biar kelihatan worker masih hidup di pm2 logs
-        if (idleTicks % Math.max(1, Math.floor(300000 / CONFIG.POLL_INTERVAL_MS)) === 0) {
+        if (idleTicks % Math.max(1, Math.floor(300000 / CONFIG.ELIG_POLL_MS)) === 0) {
           console.log(`  [${ts()}] idle, menunggu job…`);
           await releaseStuckJobs();
           // Bersihkan hasil check basi + session SIWE kedaluwarsa. Hasil check
@@ -683,7 +810,10 @@ async function main() {
             /* fungsi mungkin belum ada kalau migration belum dijalankan */
           }
         }
-        await sleep(CONFIG.POLL_INTERVAL_MS);
+        // Tidur pakai interval CHECK (ratusan ms), bukan interval job mint.
+        // Job mint tidak dirugikan: jadwalnya menit-menitan, dan tiap tick
+        // claimNextJob() tetap dipanggil.
+        await sleep(CONFIG.ELIG_POLL_MS);
       }
     } catch (err) {
       // Loop tidak boleh mati karena satu error; kalau mati, semua job
