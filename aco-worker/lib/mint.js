@@ -1,5 +1,6 @@
 import { ethers } from "ethers";
-import fetch from "node-fetch";
+// limitedFetch: rate limit per host + hormati Retry-After. Lihat rateLimiter.js.
+import { limitedFetch as fetch } from "./rateLimiter.js";
 
 const GQL_ENDPOINT = "https://gql.opensea.io/graphql";
 

@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { getAuthContext, buildDenial } from "@/lib/apiAuth";
 import { supabaseAdmin } from "@/lib/supabase";
+import { isSupportedChain, chainIdOf } from "@/lib/chains";
+import { isValidPlatform, isPlatformReady, getPlatform, DEFAULT_PLATFORM } from "@/lib/platforms";
 
 const MAX_ACTIVE_JOBS = 3;
 
@@ -16,11 +18,20 @@ export async function GET(req) {
 
   const { searchParams } = new URL(req.url);
   const limit = Math.min(parseInt(searchParams.get("limit") || "20", 10) || 20, 50);
+  const platform = searchParams.get("platform");
 
-  const { data, error } = await supabaseAdmin
+  let query = supabaseAdmin
     .from("aco_jobs")
     .select("*")
-    .eq("user_id", auth.userId)
+    .eq("user_id", auth.userId);
+
+  // Filter platform: halaman /aco punya section per platform, jadi tiap
+  // section cuma menarik job miliknya.
+  if (platform && isValidPlatform(platform)) {
+    query = query.eq("platform", platform);
+  }
+
+  const { data, error } = await query
     .order("created_at", { ascending: false })
     .limit(limit);
 
@@ -48,6 +59,22 @@ export async function POST(req) {
   if (denied) return denied;
 
   const body = await req.json().catch(() => null);
+
+  // Platform: opensea sekarang; scatter & contract belum aktif. Ditolak di
+  // sini supaya user tidak membuat job yang pasti gagal di worker.
+  const platform = String(body?.platform || DEFAULT_PLATFORM).toLowerCase();
+  if (!isValidPlatform(platform)) {
+    return NextResponse.json({ error: "Platform tidak dikenal." }, { status: 400 });
+  }
+  if (!isPlatformReady(platform)) {
+    return NextResponse.json(
+      {
+        error: `Platform ${getPlatform(platform).label} belum aktif. Untuk sekarang baru OpenSea yang jalan.`,
+        code: "PLATFORM_NOT_READY",
+      },
+      { status: 400 }
+    );
+  }
 
   const slug = String(body?.slug || "").trim().toLowerCase();
   if (!slug) {
@@ -106,13 +133,43 @@ export async function POST(req) {
   const mintAmount = Math.max(1, Math.min(parseInt(body?.mint_amount, 10) || 1, 100));
   const gasLimit = Math.max(21000, Math.min(parseInt(body?.gas_limit, 10) || 300000, 5000000));
 
+  // Chain wajib dikenali: worker butuh chain_id yang benar untuk SIWE dan
+  // untuk mengirim transaksi ke jaringan yang tepat.
+  const chain = String(body?.chain || "").toLowerCase();
+  if (!isSupportedChain(chain)) {
+    return NextResponse.json(
+      { error: `Chain "${chain || "(kosong)"}" tidak didukung.` },
+      { status: 400 }
+    );
+  }
+
+  // RPC user disnapshot ke dalam job. Kalau nanti user mengubah/menghapus
+  // RPC-nya, job yang sudah dijadwalkan tetap memakai yang berlaku saat
+  // dibuat — jadi perilakunya tidak berubah diam-diam menjelang mint.
+  const { data: rpcRow } = await supabaseAdmin
+    .from("aco_rpcs")
+    .select("encrypted_url")
+    .eq("user_id", auth.userId)
+    .eq("chain", chain)
+    .maybeSingle();
+
   const { data, error } = await supabaseAdmin
     .from("aco_jobs")
     .insert({
       user_id: auth.userId,
+      platform,
       slug,
       contract_address: body?.contract_address || null,
-      chain: body?.chain || null,
+      chain,
+      chain_id: chainIdOf(chain),
+      rpc_url: rpcRow?.encrypted_url || null,
+      // Anti-revert: default ON. Kalau simulasi memperkirakan revert, tx tidak
+      // dikirim sama sekali — gas tidak terbuang.
+      abort_on_revert: body?.abort_on_revert !== false,
+      // Auto-retry per wallet. Dibatasi 1-10 supaya tidak ada job yang
+      // mencoba tanpa henti dan menahan slot worker.
+      max_attempts: Math.max(1, Math.min(parseInt(body?.max_attempts, 10) || 3, 10)),
+      platform_config: body?.platform_config || null,
       stage_index: Number.isInteger(stage.stageIndex) ? stage.stageIndex : null,
       stage_label: stage.label || null,
       stage_type: stage.stageType || null,

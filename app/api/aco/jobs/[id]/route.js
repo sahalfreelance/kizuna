@@ -46,7 +46,18 @@ export async function GET(req, { params }) {
     return NextResponse.json({ error: "Gagal ambil log." }, { status: 500 });
   }
 
-  return NextResponse.json({ data: { job, logs: logs || [] } });
+  // Riwayat percobaan: memperlihatkan auto-retry bekerja — percobaan ke berapa
+  // yang berhasil, dan error apa yang membuat percobaan sebelumnya diulang.
+  const { data: attempts } = await supabaseAdmin
+    .from("aco_attempts")
+    .select("id, wallet_address, attempt, outcome, tx_hash, error_kind, error_message, rpc_host, duration_ms, created_at")
+    .eq("job_id", job.id)
+    .order("id", { ascending: true })
+    .limit(200);
+
+  return NextResponse.json({
+    data: { job, logs: logs || [], attempts: attempts || [] },
+  });
 }
 
 /**

@@ -73,6 +73,268 @@ function short(addr) {
   return s.length < 12 ? s : `${s.slice(0, 6)}…${s.slice(-4)}`;
 }
 
+/* ==================================================== OPENSEA KEY PANEL */
+
+function OpenseaKeyPanel() {
+  const [status, setStatus] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState(null);
+
+  const load = useCallback(async () => {
+    const res = await fetch("/api/aco/user-key", { cache: "no-store" });
+    if (res.ok) {
+      const json = await res.json();
+      setStatus(json.data);
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  async function refresh() {
+    if (busy) return;
+    setBusy(true);
+    setMsg(null);
+    try {
+      // Dijalankan dari BROWSER supaya kuota 2/hari terpakai dari IP user ini,
+      // bukan IP server yang dibagi semua user.
+      const { forceRefreshUserKey } = await import("@/lib/openseaKeyClient");
+      const result = await forceRefreshUserKey();
+      setMsg(result);
+      await load();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const ok = status?.present && !status?.expired;
+
+  return (
+    <div style={panel}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+        <h2 style={{ fontSize: 13, fontWeight: 700, letterSpacing: 0.8, color: "var(--text)" }}>
+          OPENSEA KEY
+        </h2>
+        <button onClick={refresh} disabled={busy} style={btn("ghost", busy)}>
+          {busy ? "…" : "refresh"}
+        </button>
+      </div>
+
+      {status === null ? (
+        <p style={{ fontSize: 11, color: "var(--text-dim)" }}>memuat…</p>
+      ) : !status.present ? (
+        <p style={{ fontSize: 11, color: "var(--live)", lineHeight: 1.7 }}>
+          Belum ada API key. Tekan <strong>refresh</strong> untuk membuatnya —
+          key diminta dari browser kamu, jadi tidak berebut kuota dengan user lain.
+        </p>
+      ) : (
+        <div style={{ fontSize: 11, color: "var(--text-dim)", lineHeight: 1.9 }}>
+          <div>
+            <span style={{ color: ok ? "var(--crypto)" : "#f87171" }}>
+              {ok ? "● aktif" : "✗ kedaluwarsa"}
+            </span>{" "}
+            <span style={{ color: "var(--text-mid)" }}>…{status.hint}</span>
+          </div>
+          <div>umur {status.ageDays} hari
+            {status.daysLeft != null && ` · sisa ${status.daysLeft} hari`}
+          </div>
+          {status.needsRefresh && !status.expired && (
+            <div style={{ color: "var(--live)" }}>
+              sudah waktunya diperbarui ({status.reason})
+            </div>
+          )}
+        </div>
+      )}
+
+      {msg && (
+        <div
+          style={{
+            marginTop: 9,
+            fontSize: 10.5,
+            lineHeight: 1.7,
+            color:
+              msg.action === "rate_limited"
+                ? "var(--live)"
+                : msg.action === "failed"
+                ? "#f87171"
+                : "var(--crypto)",
+          }}
+        >
+          {msg.action === "rate_limited"
+            ? "Kuota pembuatan key OpenSea habis (2 per hari dari IP kamu). Coba lagi besok — key lama tetap dipakai kalau masih berlaku."
+            : msg.reason}
+        </div>
+      )}
+
+      <p style={{ fontSize: 9.5, color: "var(--text-dim)", lineHeight: 1.65, marginTop: 10, paddingTop: 9, borderTop: "1px solid var(--border)" }}>
+        Tiap user punya API key sendiri supaya rate limit tidak bentrok saat
+        beberapa orang mint bersamaan. Key diperiksa otomatis tiap kamu login
+        dan diperbarui kalau sudah tua. Berlaku 30 hari.
+      </p>
+    </div>
+  );
+}
+
+/* ======================================================== RPC MANAGER */
+
+function RpcManager({ chains, onChange }) {
+  const [openChain, setOpenChain] = useState(null);
+  const [url, setUrl] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+
+  async function save(e) {
+    e.preventDefault();
+    if (busy || !openChain) return;
+    setError(null);
+    setBusy(true);
+    try {
+      const res = await fetch("/api/aco/rpcs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chain: openChain, rpc_url: url }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(json.error || "Gagal simpan RPC.");
+        return;
+      }
+      setUrl("");
+      setOpenChain(null);
+      onChange();
+    } catch {
+      setError("Tidak bisa menghubungi server.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function remove(chain) {
+    if (!confirm(`Hapus RPC custom untuk ${chain}?\n\nChain ini akan kembali pakai RPC publik.`)) {
+      return;
+    }
+    await fetch(`/api/aco/rpcs?chain=${encodeURIComponent(chain)}`, { method: "DELETE" });
+    onChange();
+  }
+
+  const withCustom = chains.filter((c) => c.hasCustomRpc).length;
+
+  return (
+    <div style={panel}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+        <h2 style={{ fontSize: 13, fontWeight: 700, letterSpacing: 0.8, color: "var(--text)" }}>
+          RPC{" "}
+          <span style={{ color: "var(--text-dim)", fontWeight: 400 }}>
+            ({withCustom}/{chains.length} custom)
+          </span>
+        </h2>
+      </div>
+
+      <p style={{ fontSize: 10.5, color: "var(--text-dim)", lineHeight: 1.7, marginBottom: 12 }}>
+        Chain tanpa RPC custom pakai RPC publik gratis — rate-limit ketat, bisa
+        kalah cepat saat mint rame. Isi RPC sendiri (Alchemy/Infura/QuickNode)
+        untuk chain yang sering kamu pakai.
+      </p>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+        {chains.map((c) => (
+          <div key={c.identifier}>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                background: "var(--bg2)",
+                border: "1px solid var(--border)",
+                borderRadius: 4,
+                padding: "6px 10px",
+                fontSize: 11,
+              }}
+            >
+              <span style={{ color: "var(--text)", minWidth: 88 }}>{c.label}</span>
+              <span style={{ color: "var(--text-dim)", fontSize: 9.5 }}>{c.chainId}</span>
+
+              {c.hasCustomRpc ? (
+                <span style={{ color: "var(--crypto)", fontSize: 10, marginLeft: 4 }}>
+                  {c.customHost}
+                </span>
+              ) : (
+                <span style={{ color: "var(--text-dim)", fontSize: 10, marginLeft: 4 }}>
+                  publik
+                </span>
+              )}
+
+              <div style={{ marginLeft: "auto", display: "flex", gap: 4 }}>
+                <button
+                  onClick={() => {
+                    setOpenChain(openChain === c.identifier ? null : c.identifier);
+                    setUrl("");
+                    setError(null);
+                  }}
+                  style={{
+                    background: "transparent",
+                    border: "none",
+                    color: "var(--indigo-dim)",
+                    cursor: "pointer",
+                    fontSize: 10,
+                    fontFamily: "var(--font-mono)",
+                  }}
+                >
+                  {c.hasCustomRpc ? "ganti" : "set"}
+                </button>
+                {c.hasCustomRpc && (
+                  <button
+                    onClick={() => remove(c.identifier)}
+                    style={{
+                      background: "transparent",
+                      border: "none",
+                      color: "var(--text-dim)",
+                      cursor: "pointer",
+                      fontSize: 12,
+                    }}
+                  >
+                    ×
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {openChain === c.identifier && (
+              <form onSubmit={save} style={{ marginTop: 5, marginBottom: 6, display: "flex", flexDirection: "column", gap: 6 }}>
+                <input
+                  type="text"
+                  autoComplete="off"
+                  spellCheck={false}
+                  required
+                  value={url}
+                  onChange={(e) => setUrl(e.target.value)}
+                  placeholder={`https://... atau wss://... (${c.label})`}
+                  style={{ ...input, fontSize: 11 }}
+                />
+                {error && <div style={{ fontSize: 10.5, color: "#f87171" }}>{error}</div>}
+                <div style={{ display: "flex", gap: 5 }}>
+                  <button type="submit" disabled={busy || !url} style={btn("primary", busy || !url)}>
+                    {busy ? "…" : "SIMPAN"}
+                  </button>
+                  <button type="button" onClick={() => setOpenChain(null)} style={btn("ghost")}>
+                    batal
+                  </button>
+                </div>
+                <p style={{ fontSize: 9.5, color: "var(--text-dim)", lineHeight: 1.6 }}>
+                  RPC disimpan terenkripsi dan tidak pernah ditampilkan lagi —
+                  yang muncul cuma nama host-nya. Worker memverifikasi chain id
+                  RPC sebelum mint; kalau tidak cocok, job digagalkan.
+                </p>
+              </form>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function fmtTime(iso) {
   if (!iso) return "—";
   const d = new Date(iso);
@@ -271,7 +533,7 @@ function WalletManager({ wallets, onChange }) {
 
 /* =========================================================== JOB CREATOR */
 
-function JobCreator({ wallets, onCreated }) {
+function JobCreator({ wallets, chains, platform, onCreated }) {
   const [slug, setSlug] = useState("");
   const [drop, setDrop] = useState(null);
   const [stageIdx, setStageIdx] = useState(null);
@@ -281,6 +543,26 @@ function JobCreator({ wallets, onCreated }) {
   const [loading, setLoading] = useState(false);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState(null);
+
+  // Pengaman: default anti-revert ON, 3 percobaan. Keduanya bisa diubah user
+  // per job.
+  const [abortOnRevert, setAbortOnRevert] = useState(true);
+  const [maxAttempts, setMaxAttempts] = useState(3);
+
+  // Chain ditampilkan sebagai Ethereum secara default, lalu DIGANTI otomatis
+  // dengan chain asli hasil deteksi saat slug dicek. User tidak memilih sendiri
+  // — kalau bisa dipilih, ada peluang salah pasang dan transaksi dikirim ke
+  // jaringan yang salah.
+  const detected = drop
+    ? {
+        identifier: drop.chain,
+        label: drop.chainLabel || drop.chain,
+        chainId: drop.chainId,
+        supported: drop.chainSupported,
+      }
+    : { identifier: "ethereum", label: "Ethereum", chainId: 1, supported: true };
+
+  const chainRpc = chains.find((c) => c.identifier === detected.identifier);
 
   async function loadDrop(e) {
     e.preventDefault();
@@ -323,6 +605,7 @@ function JobCreator({ wallets, onCreated }) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          platform,
           slug: drop.slug,
           contract_address: drop.contractAddress,
           chain: drop.chain,
@@ -337,6 +620,8 @@ function JobCreator({ wallets, onCreated }) {
           mint_amount: Math.min(amount, maxPerWallet),
           gas_limit: gasLimit,
           wallet_ids: selected,
+          abort_on_revert: abortOnRevert,
+          max_attempts: maxAttempts,
         }),
       });
       const json = await res.json().catch(() => ({}));
@@ -362,7 +647,7 @@ function JobCreator({ wallets, onCreated }) {
         JOB BARU
       </h2>
 
-      <form onSubmit={loadDrop} style={{ display: "flex", gap: 7, marginBottom: 14 }}>
+      <form onSubmit={loadDrop} style={{ display: "flex", gap: 7, marginBottom: 10 }}>
         <input
           type="text"
           required
@@ -376,6 +661,35 @@ function JobCreator({ wallets, onCreated }) {
         </button>
       </form>
 
+      {/* Chain: default Ethereum, diganti otomatis setelah slug dicek. */}
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          background: "var(--bg2)",
+          border: "1px solid var(--border)",
+          borderRadius: 4,
+          padding: "6px 10px",
+          fontSize: 10.5,
+          marginBottom: 14,
+        }}
+      >
+        <span style={{ color: "var(--text-dim)" }}>CHAIN</span>
+        <span style={{ color: detected.supported ? "var(--crypto)" : "#f87171" }}>
+          {detected.label}
+        </span>
+        {detected.chainId && (
+          <span style={{ color: "var(--text-dim)", fontSize: 9.5 }}>id {detected.chainId}</span>
+        )}
+        <span style={{ color: "var(--text-dim)", fontSize: 9.5 }}>
+          · RPC {chainRpc?.hasCustomRpc ? chainRpc.customHost : "publik"}
+        </span>
+        <span style={{ marginLeft: "auto", color: "var(--text-dim)", fontSize: 9.5 }}>
+          {drop ? "terdeteksi dari slug" : "default — cek slug dulu"}
+        </span>
+      </div>
+
       {error && (
         <div style={{ fontSize: 11, color: "#f87171", marginBottom: 12, lineHeight: 1.6 }}>{error}</div>
       )}
@@ -384,9 +698,42 @@ function JobCreator({ wallets, onCreated }) {
         <>
           <div style={{ fontSize: 11, color: "var(--text-dim)", marginBottom: 10, lineHeight: 1.8 }}>
             <div><span style={{ color: "var(--text-mid)" }}>{drop.name}</span></div>
-            <div>contract: {short(drop.contractAddress)} · chain: {drop.chain}</div>
+            <div>
+              contract: {short(drop.contractAddress)} ·{" "}
+              <span style={{ color: drop.chainSupported ? "var(--crypto)" : "#f87171" }}>
+                {drop.chainLabel || drop.chain}
+              </span>
+              {drop.chainId ? ` (id ${drop.chainId})` : ""}
+            </div>
           </div>
 
+          {/* Chain diambil dari OpenSea, bukan dipilih user — jadi tidak
+              mungkin salah pasang. Kalau chain-nya belum didukung, hentikan
+              di sini daripada membiarkan job dibuat lalu gagal di worker. */}
+          {!drop.chainSupported && (
+            <div
+              style={{
+                border: "1px solid #7f1d1d",
+                background: "rgba(248,113,113,0.06)",
+                borderRadius: 4,
+                padding: "9px 11px",
+                fontSize: 11,
+                lineHeight: 1.7,
+                color: "var(--text-mid)",
+                marginBottom: 12,
+              }}
+            >
+              <span style={{ color: "#f87171", fontWeight: 700 }}>
+                Chain "{drop.chain}" belum didukung.
+              </span>{" "}
+              Collection ini tidak bisa di-mint lewat ACO untuk sekarang.
+            </div>
+          )}
+        </>
+      )}
+
+      {drop && drop.stages?.length > 0 && drop.chainSupported && (
+        <>
           <label style={label}>PILIH STAGE</label>
           <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 14 }}>
             {drop.stages.map((s, i) => {
@@ -492,6 +839,58 @@ function JobCreator({ wallets, onCreated }) {
                 </div>
               )}
 
+              <label style={label}>PENGAMAN</label>
+              <div
+                style={{
+                  background: "var(--bg2)",
+                  border: "1px solid var(--border)",
+                  borderRadius: 4,
+                  padding: "9px 11px",
+                  marginBottom: 14,
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 8,
+                }}
+              >
+                <label style={{ display: "flex", alignItems: "flex-start", gap: 7, cursor: "pointer" }}>
+                  <input
+                    type="checkbox"
+                    checked={abortOnRevert}
+                    onChange={(e) => setAbortOnRevert(e.target.checked)}
+                    style={{ marginTop: 2, accentColor: "var(--indigo)" }}
+                  />
+                  <span style={{ fontSize: 10.5, lineHeight: 1.65, color: "var(--text-mid)" }}>
+                    <strong style={{ color: "var(--text)" }}>Anti-revert</strong> — simulasi
+                    tx dulu (eth_call). Kalau diperkirakan gagal, tx tidak dikirim
+                    dan gas tidak terbuang.
+                    <span style={{ color: "var(--text-dim)" }}>
+                      {" "}Matikan hanya kalau kamu sengaja mau memaksa kirim.
+                    </span>
+                  </span>
+                </label>
+
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ fontSize: 10.5, color: "var(--text-mid)" }}>
+                    Auto-retry per wallet
+                  </span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={10}
+                    value={maxAttempts}
+                    onChange={(e) =>
+                      setMaxAttempts(Math.max(1, Math.min(parseInt(e.target.value) || 3, 10)))
+                    }
+                    style={{ ...input, width: 62, padding: "4px 7px", fontSize: 11 }}
+                  />
+                  <span style={{ fontSize: 9.5, color: "var(--text-dim)", lineHeight: 1.5 }}>
+                    percobaan. Error sementara (RPC mati, rate limit, stage belum
+                    buka) diulang otomatis; error final (tidak eligible, sold out,
+                    saldo kurang) tidak.
+                  </span>
+                </div>
+              </div>
+
               <button
                 onClick={createJob}
                 disabled={creating || selected.length === 0}
@@ -512,11 +911,83 @@ function JobCreator({ wallets, onCreated }) {
   );
 }
 
+/* ================================================== PLATFORM BELUM SIAP */
+
+/**
+ * Panel untuk platform yang belum aktif (Scatter, mint-by-contract).
+ *
+ * Sengaja TIDAK menampilkan form yang bisa diisi: form yang menerima input
+ * lalu gagal di worker lebih buruk daripada penjelasan jujur bahwa fiturnya
+ * belum ada.
+ */
+function PlatformComingSoon({ platform }) {
+  return (
+    <div style={panel}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+        <h2 style={{ fontSize: 13, fontWeight: 700, letterSpacing: 0.8, color: "var(--text)" }}>
+          {platform.label.toUpperCase()}
+        </h2>
+        <span
+          style={{
+            fontSize: 9,
+            letterSpacing: 0.8,
+            color: "var(--live)",
+            border: "1px solid var(--live)",
+            borderRadius: 3,
+            padding: "1px 6px",
+          }}
+        >
+          BELUM AKTIF
+        </span>
+      </div>
+
+      <p style={{ fontSize: 11, color: "var(--text-dim)", lineHeight: 1.8, marginBottom: 14 }}>
+        {platform.description}
+      </p>
+
+      <div
+        style={{
+          background: "var(--bg2)",
+          border: "1px solid var(--border)",
+          borderRadius: 4,
+          padding: "11px 13px",
+          fontSize: 10.5,
+          lineHeight: 1.85,
+          color: "var(--text-dim)",
+        }}
+      >
+        <div style={{ color: "var(--text-mid)", marginBottom: 6 }}>
+          Yang sudah siap dipakai bersama nanti:
+        </div>
+        <div>· Wallet terenkripsi — sama, tidak perlu import ulang</div>
+        <div>· RPC per chain + fallback otomatis</div>
+        <div>· Anti-revert (simulasi sebelum kirim)</div>
+        <div>· Auto-retry dengan klasifikasi error</div>
+        <div>· Anti rate-limit (token bucket per host)</div>
+        {platform.needsAbi && (
+          <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px solid var(--border)", color: "var(--live)" }}>
+            Yang masih perlu dibangun: penyusun calldata dari ABI. Tiap kontrak
+            beda nama fungsi dan argumennya, jadi tidak bisa dideteksi otomatis
+            seperti OpenSea — user harus memberi ABI dan argumennya sendiri.
+          </div>
+        )}
+        {!platform.needsAbi && platform.id === "scatter" && (
+          <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px solid var(--border)", color: "var(--live)" }}>
+            Yang masih perlu dibangun: pemetaan endpoint Scatter untuk mengambil
+            jadwal stage dan calldata mint.
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 /* ============================================================= JOB DETAIL */
 
 function JobDetail({ jobId, onClose, onChanged }) {
   const [job, setJob] = useState(null);
   const [logs, setLogs] = useState([]);
+  const [attempts, setAttempts] = useState([]);
   const lastLogId = useRef(0);
   const logBox = useRef(null);
 
@@ -530,6 +1001,7 @@ function JobDetail({ jobId, onClose, onChanged }) {
       if (!json.data) return;
 
       setJob(json.data.job);
+      setAttempts(json.data.attempts || []);
       if (json.data.logs.length > 0) {
         setLogs((prev) => [...prev, ...json.data.logs]);
         lastLogId.current = json.data.logs[json.data.logs.length - 1].id;
@@ -588,6 +1060,18 @@ function JobDetail({ jobId, onClose, onChanged }) {
       </div>
 
       <div style={{ fontSize: 10.5, color: "var(--text-dim)", lineHeight: 1.9, marginBottom: 12 }}>
+        <div>
+          chain: <span style={{ color: "var(--text-mid)" }}>{job.chain}</span>
+          {job.chain_id ? ` (id ${job.chain_id})` : ""}
+          {job.rpc_url ? " · RPC custom" : " · RPC publik"}
+        </div>
+        <div>
+          anti-revert:{" "}
+          <span style={{ color: job.abort_on_revert === false ? "var(--live)" : "var(--crypto)" }}>
+            {job.abort_on_revert === false ? "OFF" : "ON"}
+          </span>
+          {" · "}maks {job.max_attempts || 3} percobaan/wallet
+        </div>
         <div>wallet: {job.wallet_ids?.length || 0} · amount: {job.mint_amount} · gas: {job.gas_limit}</div>
         <div>stage mulai: {fmtTime(job.stage_start_time)}
           {job.status === "QUEUED" && countdown(job.stage_start_time) && (
@@ -605,13 +1089,43 @@ function JobDetail({ jobId, onClose, onChanged }) {
           <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
             {job.result_summary.map((r, i) => (
               <div key={i} style={{ fontSize: 10.5, display: "flex", gap: 7, alignItems: "baseline" }}>
-                <span style={{ color: r.success ? "var(--crypto)" : "#f87171" }}>
-                  {r.success ? "OK " : "GAGAL"}
+                <span
+                  style={{
+                    color: r.success
+                      ? "var(--crypto)"
+                      : r.prevented
+                      ? "var(--live)"
+                      : r.unconfirmed
+                      ? "var(--live)"
+                      : "#f87171",
+                    minWidth: 62,
+                  }}
+                >
+                  {r.success
+                    ? "OK"
+                    : r.prevented
+                    ? "DICEGAH"
+                    : r.unconfirmed
+                    ? "CEK TX"
+                    : "GAGAL"}
                 </span>
                 <span style={{ color: "var(--indigo-dim)" }}>{short(r.address)}</span>
                 {r.txHash ? (
                   <a
-                    href={`https://etherscan.io/tx/${r.txHash}`}
+                    href={
+                      job.chain === "base" ? `https://basescan.org/tx/${r.txHash}`
+                      : job.chain === "arbitrum" ? `https://arbiscan.io/tx/${r.txHash}`
+                      : job.chain === "optimism" ? `https://optimistic.etherscan.io/tx/${r.txHash}`
+                      : job.chain === "polygon" ? `https://polygonscan.com/tx/${r.txHash}`
+                      : job.chain === "zora" ? `https://explorer.zora.energy/tx/${r.txHash}`
+                      : job.chain === "blast" ? `https://blastscan.io/tx/${r.txHash}`
+                      : job.chain === "avalanche" ? `https://snowtrace.io/tx/${r.txHash}`
+                      : job.chain === "sei" ? `https://seitrace.com/tx/${r.txHash}`
+                      : job.chain === "ape_chain" ? `https://apescan.io/tx/${r.txHash}`
+                      : job.chain === "ronin" ? `https://app.roninchain.com/tx/${r.txHash}`
+                      : job.chain === "ink" ? `https://explorer.inkonchain.com/tx/${r.txHash}`
+                      : `https://etherscan.io/tx/${r.txHash}`
+                    }
                     target="_blank"
                     rel="noreferrer"
                     style={{ color: "var(--text-mid)", textDecoration: "underline" }}
@@ -623,6 +1137,96 @@ function JobDetail({ jobId, onClose, onChanged }) {
                 )}
               </div>
             ))}
+          </div>
+
+          {/* Ringkasan pengaman. `prevented` BUKAN kegagalan — itu gas yang
+              berhasil diselamatkan sebelum tx dikirim. */}
+          {job.preflight && (
+            <div
+              style={{
+                marginTop: 9,
+                fontSize: 10,
+                color: "var(--text-dim)",
+                lineHeight: 1.75,
+                paddingTop: 8,
+                borderTop: "1px solid var(--border)",
+              }}
+            >
+              {job.preflight.prevented > 0 && (
+                <div style={{ color: "var(--live)" }}>
+                  {job.preflight.prevented} tx dicegah sebelum kirim — gas tidak terbuang
+                </div>
+              )}
+              {job.preflight.unconfirmed > 0 && (
+                <div style={{ color: "var(--live)" }}>
+                  {job.preflight.unconfirmed} tx terkirim tapi status tidak jelas — cek manual di explorer
+                </div>
+              )}
+              {Array.isArray(job.preflight.rpc) &&
+                job.preflight.rpc
+                  .filter((r) => r.ok > 0 || r.fail > 0)
+                  .map((r, i) => (
+                    <div key={i}>
+                      RPC {r.host}: {r.ok} ok
+                      {r.fail > 0 && (
+                        <span style={{ color: "#f87171" }}> · {r.fail} gagal</span>
+                      )}
+                    </div>
+                  ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Riwayat percobaan: ini yang memperlihatkan auto-retry bekerja. */}
+      {attempts.length > 0 && (
+        <div style={{ marginBottom: 12 }}>
+          <label style={label}>PERCOBAAN ({attempts.length})</label>
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: 3,
+              maxHeight: 150,
+              overflowY: "auto",
+              background: "var(--bg2)",
+              border: "1px solid var(--border)",
+              borderRadius: 4,
+              padding: "7px 9px",
+            }}
+          >
+            {attempts.map((a) => {
+              const color =
+                a.outcome === "SUCCESS"
+                  ? "var(--crypto)"
+                  : a.outcome === "SENT"
+                  ? "var(--indigo-dim)"
+                  : a.outcome === "PREFLIGHT_FAIL"
+                  ? "var(--live)"
+                  : "#f87171";
+              return (
+                <div key={a.id} style={{ fontSize: 9.5, display: "flex", gap: 6, alignItems: "baseline" }}>
+                  <span style={{ color: "var(--text-dim)", minWidth: 16 }}>
+                    #{a.attempt || "-"}
+                  </span>
+                  <span style={{ color: "var(--indigo-dim)", minWidth: 74 }}>
+                    {short(a.wallet_address)}
+                  </span>
+                  <span style={{ color, minWidth: 88 }}>{a.outcome}</span>
+                  {a.error_kind && (
+                    <span style={{ color: "var(--text-dim)" }}>{a.error_kind}</span>
+                  )}
+                  {a.rpc_host && (
+                    <span style={{ color: "var(--text-dim)", fontSize: 9 }}>{a.rpc_host}</span>
+                  )}
+                  {a.duration_ms != null && (
+                    <span style={{ marginLeft: "auto", color: "var(--text-dim)", fontSize: 9 }}>
+                      {a.duration_ms}ms
+                    </span>
+                  )}
+                </div>
+              );
+            })}
           </div>
         </div>
       )}
@@ -674,6 +1278,9 @@ function JobDetail({ jobId, onClose, onChanged }) {
 
 export default function AcoDashboard() {
   const [wallets, setWallets] = useState([]);
+  const [chains, setChains] = useState([]);
+  const [platforms, setPlatforms] = useState([]);
+  const [activePlatform, setActivePlatform] = useState("opensea");
   const [jobs, setJobs] = useState([]);
   const [openJob, setOpenJob] = useState(null);
   const [loaded, setLoaded] = useState(false);
@@ -686,19 +1293,45 @@ export default function AcoDashboard() {
     }
   }, []);
 
+  const loadChains = useCallback(async () => {
+    const res = await fetch("/api/aco/rpcs", { cache: "no-store" });
+    if (res.ok) {
+      const json = await res.json();
+      setChains(json.data || []);
+    }
+  }, []);
+
+  const loadPlatforms = useCallback(async () => {
+    const res = await fetch("/api/aco/platforms", { cache: "no-store" });
+    if (res.ok) {
+      const json = await res.json();
+      setPlatforms(json.data || []);
+    }
+  }, []);
+
+  // Job difilter per platform supaya tiap section cuma menampilkan miliknya.
   const loadJobs = useCallback(async () => {
-    const res = await fetch("/api/aco/jobs", { cache: "no-store" });
+    const res = await fetch(`/api/aco/jobs?platform=${activePlatform}`, {
+      cache: "no-store",
+    });
     if (res.ok) {
       const json = await res.json();
       setJobs(json.data || []);
     }
     setLoaded(true);
-  }, []);
+  }, [activePlatform]);
 
   useEffect(() => {
     loadWallets();
+    loadChains();
+    loadPlatforms();
+  }, [loadWallets, loadChains, loadPlatforms]);
+
+  useEffect(() => {
+    setLoaded(false);
+    setOpenJob(null);
     loadJobs();
-  }, [loadWallets, loadJobs]);
+  }, [loadJobs]);
 
   // Refresh daftar job berkala supaya status berubah sendiri saat worker
   // memproses. Detail job punya polling sendiri yang lebih cepat.
@@ -710,21 +1343,69 @@ export default function AcoDashboard() {
   }, [loadJobs]);
 
   const activeCount = jobs.filter((j) => ["QUEUED", "CLAIMED", "RUNNING"].includes(j.status)).length;
+  const current = platforms.find((p) => p.id === activePlatform);
+  const ready = current?.status === "ready";
 
   return (
     <main style={{ maxWidth: 1400, margin: "0 auto", padding: "22px 20px 60px" }}>
-      <div style={{ marginBottom: 18 }}>
+      <div style={{ marginBottom: 14 }}>
         <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
           <h1 style={{ fontSize: 17, fontWeight: 700, letterSpacing: 1, color: "var(--text)" }}>
             <span style={{ color: "var(--indigo-dim)" }}>~/</span>aco
           </h1>
           <span style={{ fontSize: 11, color: "var(--text-dim)" }}>
-            auto checkout opensea · {wallets.length} wallet · {activeCount} job aktif
+            {wallets.length} wallet · {chains.length} chain · {activeCount} job aktif
           </span>
         </div>
         <p style={{ fontSize: 11, color: "var(--text-dim)", marginTop: 4, lineHeight: 1.7 }}>
-          Jadwalkan mint, worker di VPS yang eksekusi. Browser boleh ditutup.
+          Anti-revert · auto-retry · anti rate-limit · RPC fallback. Worker di
+          VPS yang eksekusi, browser boleh ditutup.
         </p>
+      </div>
+
+      {/* Tab platform. Wallet & RPC dipakai bersama semua platform, jadi
+          panel kiri tidak ikut berganti. */}
+      <div
+        style={{
+          display: "flex",
+          gap: 4,
+          marginBottom: 16,
+          borderBottom: "1px solid var(--border)",
+          flexWrap: "wrap",
+        }}
+      >
+        {platforms.map((p) => {
+          const on = p.id === activePlatform;
+          const soon = p.status !== "ready";
+          return (
+            <button
+              key={p.id}
+              onClick={() => setActivePlatform(p.id)}
+              style={{
+                background: on ? "var(--bg2)" : "transparent",
+                border: "1px solid var(--border)",
+                borderBottom: on ? "1px solid var(--bg2)" : "1px solid transparent",
+                borderRadius: "4px 4px 0 0",
+                padding: "7px 14px",
+                marginBottom: -1,
+                cursor: "pointer",
+                fontFamily: "var(--font-mono)",
+                fontSize: 11.5,
+                color: on ? "var(--text)" : "var(--text-dim)",
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+              }}
+            >
+              {p.label}
+              {soon && (
+                <span style={{ fontSize: 8.5, color: "var(--live)", letterSpacing: 0.5 }}>
+                  SOON
+                </span>
+              )}
+            </button>
+          );
+        })}
       </div>
 
       <div
@@ -737,10 +1418,16 @@ export default function AcoDashboard() {
       >
         <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
           <WalletManager wallets={wallets} onChange={loadWallets} />
+          <OpenseaKeyPanel />
+          <RpcManager chains={chains} onChange={loadChains} />
         </div>
 
         <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-          {openJob ? (
+          {!current ? (
+            <div style={{ ...panel, fontSize: 11.5, color: "var(--text-dim)" }}>memuat…</div>
+          ) : !ready ? (
+            <PlatformComingSoon platform={current} />
+          ) : openJob ? (
             <JobDetail
               jobId={openJob}
               onClose={() => setOpenJob(null)}
@@ -749,20 +1436,24 @@ export default function AcoDashboard() {
           ) : (
             <JobCreator
               wallets={wallets}
+              chains={chains}
+              platform={activePlatform}
               onCreated={() => { loadJobs(); }}
             />
           )}
 
           <div style={panel}>
             <h2 style={{ fontSize: 13, fontWeight: 700, letterSpacing: 0.8, color: "var(--text)", marginBottom: 12 }}>
-              RIWAYAT JOB
+              RIWAYAT JOB {current ? `— ${current.label.toUpperCase()}` : ""}
             </h2>
 
             {!loaded ? (
               <p style={{ fontSize: 11.5, color: "var(--text-dim)" }}>memuat…</p>
             ) : jobs.length === 0 ? (
               <p style={{ fontSize: 11.5, color: "var(--text-dim)", lineHeight: 1.7 }}>
-                Belum ada job. Bikin di atas.
+                {ready
+                  ? "Belum ada job. Bikin di atas."
+                  : `Belum ada job ${current?.label ?? ""} — platform ini belum aktif.`}
               </p>
             ) : (
               <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>

@@ -4,9 +4,13 @@ import { ethers } from "ethers";
 import { supabase, supabaseConfigError } from "./lib/supabase.js";
 import { createJobLogger } from "./lib/jobLogger.js";
 import { decryptPrivateKey, assertEncryptionKeyReady } from "./lib/walletCrypto.js";
-import { siweLogin, hasOpenseaApiKey } from "./lib/auth.js";
-import { fetchDropInfo, fetchCalldataWithRetry } from "./lib/graphql.js";
-import { prefetchNonce, sendMintTx, waitForMintStatus } from "./lib/mint.js";
+import { getOpenseaApiKey, invalidateCache } from "./lib/openseaKey.js";
+import { getChain, SUPPORTED_CHAINS } from "./lib/chains.js";
+import { RpcPool } from "./lib/rpcPool.js";
+import { statsSnapshot } from "./lib/rateLimiter.js";
+import { mintWalletGuarded } from "./lib/mintGuarded.js";
+import { siweLogin } from "./lib/auth.js";
+import { fetchDropInfo } from "./lib/graphql.js";
 
 /**
  * ACO Worker — eksekutor job mint dari website Kizuna.
@@ -24,15 +28,17 @@ import { prefetchNonce, sendMintTx, waitForMintStatus } from "./lib/mint.js";
  */
 
 const CONFIG = {
-  RPC_URL: process.env.RPC_URL,
-  CHAIN_ID: parseInt(process.env.CHAIN_ID) || 1,
+  // RPC cadangan kalau job tidak membawa RPC user dan chain-nya tidak punya
+  // default. Opsional sekarang — tiap chain di lib/chains.js sudah punya
+  // defaultRpc sendiri.
+  RPC_URL: process.env.RPC_URL || null,
   POLL_INTERVAL_MS: parseInt(process.env.POLL_INTERVAL_MS) || 5000,
   WORKER_ID: process.env.WORKER_ID || `worker-${process.pid}`,
   // Job yang stage-nya sudah lewat lebih dari ini dianggap kedaluwarsa.
   MAX_LATE_MS: parseInt(process.env.MAX_LATE_MS) || 5 * 60 * 1000,
 };
 
-const WORKER_VERSION = "v1";
+const WORKER_VERSION = "v2";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const ts = () => new Date().toISOString().replace("T", " ").slice(0, 19) + " UTC";
@@ -131,7 +137,7 @@ async function releaseStuckJobs() {
  * kalau banyak wallet login berbarengan, jadi diproses sequential dengan jeda
  * antar batch.
  */
-async function loginWallets(wallets, log, opts = {}) {
+async function loginWallets(wallets, chainId, apiKey, userId, log, opts = {}) {
   const { batchSize = 5, delayMs = 1000, maxRetries = 3, retryDelayMs = 2000 } = opts;
 
   const sessions = [];
@@ -144,13 +150,19 @@ async function loginWallets(wallets, log, opts = {}) {
 
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-          const cookieStr = await siweLogin(w.privateKey, CONFIG.CHAIN_ID);
+          const cookieStr = await siweLogin(w.privateKey, chainId, null, apiKey);
           sessions.push({ wallet: w.signer, address: w.address, cookieStr });
           await log.ok("Login OpenSea berhasil", w.address);
           ok = true;
           break;
         } catch (err) {
-          const is429 = String(err.message).includes("429");
+          const msg = String(err.message);
+          const is429 = msg.includes("429");
+          // 401/403 = API key ditolak. Buang cache-nya supaya percobaan
+          // berikutnya mengambil key baru dari website.
+          if (msg.includes("401") || msg.includes("403")) {
+            invalidateCache(userId);
+          }
           if (is429 && attempt < maxRetries) {
             await log.warn(
               `Rate limited, coba lagi (${attempt}/${maxRetries})`,
@@ -213,62 +225,6 @@ async function waitForWindow(startTimeISO, jobId, log) {
   }
 }
 
-/* ------------------------------------------------------------ mint 1 wallet */
-
-async function mintOne({ session, job, contractAddress, chain, startTs, log }) {
-  const { wallet, address, cookieStr } = session;
-
-  try {
-    const cachedNonce = await prefetchNonce(wallet);
-
-    const calldataResults = await fetchCalldataWithRetry(
-      [{ address, cookieStr }],
-      contractAddress,
-      chain,
-      cookieStr,
-      {
-        startTime: startTs,
-        maxRetries: 300,
-        retryDelayMs: 200,
-        quantity: String(job.mint_amount),
-      }
-    );
-
-    if (!calldataResults || calldataResults.length === 0) {
-      throw new Error("Tidak dapat calldata — wallet mungkin tidak eligible");
-    }
-
-    const calldata = calldataResults[0];
-    await log.ok(`Calldata siap → ${calldata.to}`, address);
-
-    const tx = await sendMintTx(wallet, calldata, {
-      cachedNonce,
-      gasLimit: job.gas_limit,
-    });
-    await log.ok(`Tx dikirim: ${tx.hash}`, address);
-
-    const receipt = await waitForMintStatus(
-      tx.hash,
-      contractAddress,
-      chain,
-      job.price_unit || "0",
-      cookieStr
-    );
-
-    const success = receipt?.status === "SUCCESS";
-    if (success) {
-      await log.ok(`Mint SUKSES · tx ${tx.hash}`, address);
-    } else {
-      await log.error(`Mint gagal menurut OpenSea (${receipt?.status})`, address);
-    }
-
-    return { address, success, txHash: tx.hash };
-  } catch (err) {
-    await log.error(`Error: ${err.message}`, address);
-    return { address, success: false, error: String(err.message).slice(0, 300) };
-  }
-}
-
 /* ------------------------------------------------------------- proses job */
 
 async function processJob(job) {
@@ -279,10 +235,108 @@ async function processJob(job) {
 
   await log.info(`Job diambil worker ${CONFIG.WORKER_ID} (${WORKER_VERSION})`);
 
-  let provider;
+  let pool;
 
   try {
-    // ---- 1. Ambil wallet + dekripsi -------------------------------------
+    // ---- 1. Tentukan chain & RPC ----------------------------------------
+    const chainInfo = getChain(job.chain);
+    if (!chainInfo) {
+      throw new Error(
+        `Chain "${job.chain}" tidak didukung worker. ` +
+          `Yang didukung: ${SUPPORTED_CHAINS.map((c) => c.identifier).join(", ")}`
+      );
+    }
+
+    const chainId = job.chain_id || chainInfo.chainId;
+
+    // ---- Susun POOL RPC, bukan satu RPC ---------------------------------
+    // Anti-revert & anti-gagal: kalau RPC utama mati/lambat/rate-limit di
+    // detik-detik mint, worker pindah ke RPC berikutnya tanpa menggagalkan
+    // job. Urutan: RPC snapshot di job -> semua RPC user untuk chain ini
+    // (urut prioritas) -> RPC publik default -> RPC_URL dari .env.
+    const rpcEntries = [];
+    const seenUrls = new Set();
+
+    const pushRpc = (url, source) => {
+      if (!url || seenUrls.has(url)) return;
+      seenUrls.add(url);
+      let host = "unknown";
+      try {
+        host = new URL(url).hostname;
+      } catch {
+        /* biarkan unknown */
+      }
+      rpcEntries.push({ url, host, source });
+    };
+
+    if (job.rpc_url) {
+      try {
+        pushRpc(decryptPrivateKey(job.rpc_url), "user (snapshot job)");
+      } catch (err) {
+        await log.warn(`Gagal dekripsi RPC snapshot job: ${err.message}`);
+      }
+    }
+
+    // RPC fallback milik user untuk chain ini.
+    try {
+      const { data: userRpcs } = await supabase
+        .from("aco_rpcs")
+        .select("encrypted_url, display_host, priority")
+        .eq("user_id", job.user_id)
+        .eq("chain", job.chain)
+        .order("priority", { ascending: true });
+
+      for (const r of userRpcs || []) {
+        try {
+          pushRpc(decryptPrivateKey(r.encrypted_url), `user (prioritas ${r.priority})`);
+        } catch {
+          await log.warn(`RPC user ${r.display_host || "?"} gagal didekripsi, dilewati`);
+        }
+      }
+    } catch (err) {
+      await log.warn(`Tidak bisa baca RPC fallback user: ${err.message}`);
+    }
+
+    pushRpc(chainInfo.defaultRpc, "publik default");
+    pushRpc(CONFIG.RPC_URL, ".env worker");
+
+    if (rpcEntries.length === 0) {
+      throw new Error(`Tidak ada RPC untuk chain ${chainInfo.label}`);
+    }
+
+    pool = new RpcPool(rpcEntries, chainId, { log });
+
+    await log.info(
+      `Chain ${chainInfo.label} (id ${chainId}) · ${rpcEntries.length} RPC: ` +
+        rpcEntries.map((e) => e.host).join(", ")
+    );
+
+    // Verifikasi ada minimal satu RPC sehat DAN chain id-nya benar. Kalau RPC
+    // salah chain, transaksi akan dikirim ke jaringan yang salah — lebih baik
+    // gagal sekarang.
+    try {
+      const probe = await pool.call((p) => p.getBlockNumber(), { label: "cek RPC" });
+      await log.ok(`RPC siap: ${probe.entry.host} (block ${probe.result})`);
+    } catch (err) {
+      throw new Error(
+        `Semua RPC bermasalah untuk ${chainInfo.label}: ${err.message}. ` +
+          "Tambahkan RPC sendiri di halaman /aco."
+      );
+    }
+
+    // ---- 2. Ambil API key OpenSea (milik user pemilik job) ---------------
+    // Key per user, bukan key bersama: rate limit pemakaian berlaku per key,
+    // jadi kalau beberapa user mint bersamaan dengan key yang sama, request
+    // saling berebut kuota dan sebagian gagal.
+    const apiKey = await getOpenseaApiKey(job.user_id);
+    if (!apiKey) {
+      throw new Error(
+        "API key OpenSea tidak tersedia untuk user ini. Minta user login ulang " +
+          "ke website, atau tekan refresh key di halaman /aco."
+      );
+    }
+
+    // ---- 3. Ambil wallet + dekripsi -------------------------------------
     const { data: walletRows, error: walletError } = await supabase
       .from("aco_wallets")
       .select("id, address, encrypted_key, label")
@@ -291,22 +345,17 @@ async function processJob(job) {
     if (walletError) throw new Error(`Gagal ambil wallet: ${walletError.message}`);
     if (!walletRows?.length) throw new Error("Wallet tidak ditemukan");
 
-    // JsonRpcProvider (HTTP) dipakai kalau RPC_URL bukan ws://. Script CLI
-    // pakai WebSocketProvider; di worker yang hidup terus dua-duanya jalan,
-    // jadi dipilih otomatis berdasarkan skema URL.
-    provider = CONFIG.RPC_URL.startsWith("ws")
-      ? new ethers.WebSocketProvider(CONFIG.RPC_URL)
-      : new ethers.JsonRpcProvider(CONFIG.RPC_URL);
-
     const wallets = [];
     for (const row of walletRows) {
       try {
         const privateKey = decryptPrivateKey(row.encrypted_key);
-        const signer = new ethers.Wallet(privateKey, provider);
+        // Signer dibuat tanpa provider dulu — provider ditentukan per operasi
+        // oleh RpcPool, supaya failover bisa jalan.
+        const base = new ethers.Wallet(privateKey);
 
         // Pengaman: address hasil dekripsi harus cocok dengan yang tercatat.
         // Kalau tidak, ada yang salah — jangan lanjut pakai wallet itu.
-        if (signer.address.toLowerCase() !== row.address.toLowerCase()) {
+        if (base.address.toLowerCase() !== row.address.toLowerCase()) {
           await log.error(
             `Address tidak cocok dengan data tersimpan, wallet dilewati`,
             row.address
@@ -314,7 +363,12 @@ async function processJob(job) {
           continue;
         }
 
-        wallets.push({ address: signer.address, privateKey, signer });
+        wallets.push({
+          address: base.address,
+          privateKey,
+          // Dipakai RpcPool.sendOnce untuk mengikat signer ke provider aktif.
+          signerFor: (provider) => new ethers.Wallet(privateKey, provider),
+        });
       } catch (err) {
         await log.error(`Gagal dekripsi wallet: ${err.message}`, row.address);
       }
@@ -326,9 +380,9 @@ async function processJob(job) {
 
     await log.info(`${wallets.length} wallet siap`);
 
-    // ---- 2. Login SIWE ---------------------------------------------------
+    // ---- 4. Login SIWE ---------------------------------------------------
     await log.info("Login ke OpenSea…");
-    const sessions = await loginWallets(wallets, log);
+    const sessions = await loginWallets(wallets, chainId, apiKey, job.user_id, log);
 
     if (sessions.length === 0) {
       throw new Error("Semua wallet gagal login OpenSea");
@@ -340,17 +394,24 @@ async function processJob(job) {
       return;
     }
 
-    // ---- 3. Konfirmasi drop info ----------------------------------------
-    // Contract & chain sudah disimpan saat job dibuat, tapi diambil ulang
-    // untuk memastikan datanya masih benar saat eksekusi.
+    // ---- 5. Konfirmasi drop info ----------------------------------------
+    // Contract & jadwal diambil ulang untuk memastikan datanya masih benar
+    // saat eksekusi. `chain` TIDAK diubah dari hasil refresh: provider sudah
+    // dibuat dan diverifikasi untuk chain ini, jadi kalau OpenSea melaporkan
+    // chain berbeda itu kondisi ganjil yang lebih aman digagalkan.
     let contractAddress = job.contract_address;
-    let chain = job.chain;
     let startTimeISO = job.stage_start_time;
 
     try {
       const drop = await fetchDropInfo(job.slug, sessions[0].cookieStr);
       if (drop?.contractAddress) contractAddress = drop.contractAddress;
-      if (drop?.chain) chain = drop.chain;
+
+      if (drop?.chain && drop.chain !== job.chain) {
+        throw new Error(
+          `Collection sekarang di chain "${drop.chain}", tapi job dibuat untuk ` +
+            `"${job.chain}". Batalkan dan bikin job baru.`
+        );
+      }
 
       // Stage bisa bergeser jadwalnya. Cocokkan lewat stage_index kalau ada.
       const stage =
@@ -364,13 +425,16 @@ async function processJob(job) {
         startTimeISO = stage.startTime;
       }
     } catch (err) {
+      // Ketidakcocokan chain itu fatal, bukan sesuatu yang boleh dilewati.
+      if (String(err.message).includes("Collection sekarang di chain")) throw err;
       await log.warn(`Tidak bisa refresh drop info: ${err.message}. Pakai data tersimpan.`);
     }
 
-    if (!contractAddress || !chain) {
-      throw new Error("Contract address / chain tidak diketahui");
+    if (!contractAddress) {
+      throw new Error("Contract address tidak diketahui");
     }
 
+    const chain = job.chain;
     await log.info(`Contract ${contractAddress} · chain ${chain}`);
 
     // Job yang jadwalnya sudah lewat jauh tidak usah dijalankan.
@@ -381,7 +445,7 @@ async function processJob(job) {
       );
     }
 
-    // ---- 4. Tunggu window ----------------------------------------------
+    // ---- 6. Tunggu window ----------------------------------------------
     await setJobStatus(job.id, { started_at: new Date().toISOString() });
 
     const startTs = await waitForWindow(startTimeISO, job.id, log);
@@ -390,13 +454,30 @@ async function processJob(job) {
       return;
     }
 
-    // ---- 5. Mint semua wallet paralel -----------------------------------
+    // ---- 7. Mint semua wallet paralel -----------------------------------
     await setJobStatus(job.id, { status: "RUNNING" });
-    await log.info(`Mint dengan ${sessions.length} wallet (paralel)…`);
+    await log.info(
+      `Mint dengan ${sessions.length} wallet (paralel) · ` +
+        `maks ${job.max_attempts || 3} percobaan/wallet · ` +
+        `anti-revert ${job.abort_on_revert === false ? "OFF" : "ON"}`
+    );
+
+    const startTimeMs = new Date(startTimeISO).getTime();
 
     const settled = await Promise.allSettled(
       sessions.map((session) =>
-        mintOne({ session, job, contractAddress, chain, startTs, log })
+        mintWalletGuarded({
+          supabase,
+          session,
+          job,
+          pool,
+          contractAddress,
+          chain,
+          startTs,
+          startTimeMs,
+          apiKey,
+          log,
+        })
       )
     );
 
@@ -407,14 +488,40 @@ async function processJob(job) {
     );
 
     const successCount = results.filter((r) => r.success).length;
+    const preventedCount = results.filter((r) => r.prevented).length;
+    const unconfirmedCount = results.filter((r) => r.unconfirmed).length;
 
     await setJobStatus(job.id, {
       status: "DONE",
       finished_at: new Date().toISOString(),
       result_summary: results,
+      preflight: {
+        prevented: preventedCount,
+        unconfirmed: unconfirmedCount,
+        rpc: pool.summary(),
+        rateLimit: statsSnapshot(),
+      },
     });
 
-    await log.ok(`Selesai — ${successCount}/${results.length} wallet berhasil mint`);
+    let ringkasan = `Selesai — ${successCount}/${results.length} wallet berhasil mint`;
+    if (preventedCount > 0) {
+      // Ini bukan kegagalan: gas berhasil diselamatkan.
+      ringkasan += ` · ${preventedCount} dicegah sebelum kirim (gas aman)`;
+    }
+    if (unconfirmedCount > 0) {
+      ringkasan += ` · ${unconfirmedCount} tx perlu dicek manual`;
+    }
+    await log.ok(ringkasan);
+
+    // Ringkasan kesehatan RPC — berguna buat user memutuskan perlu ganti RPC.
+    for (const r of pool.summary()) {
+      if (r.fail > 0) {
+        await log.warn(
+          `RPC ${r.host} (${r.source}): ${r.ok} sukses, ${r.fail} gagal` +
+            (r.lastError ? ` — ${r.lastError.slice(0, 80)}` : "")
+        );
+      }
+    }
   } catch (err) {
     console.error(`  [worker] job ${job.id.slice(0, 8)} gagal: ${err.message}`);
     await log.error(err.message);
@@ -424,10 +531,10 @@ async function processJob(job) {
       finished_at: new Date().toISOString(),
     });
   } finally {
-    // WebSocketProvider memegang koneksi; wajib ditutup atau proses menumpuk
-    // socket tiap job dan akhirnya kehabisan file descriptor.
+    // RpcPool memegang provider (WebSocket bisa menahan socket); wajib ditutup
+    // atau proses menumpuk koneksi tiap job dan kehabisan file descriptor.
     try {
-      await provider?.destroy?.();
+      await pool?.destroy?.();
     } catch {
       /* abaikan */
     }
@@ -444,21 +551,10 @@ async function main() {
   console.log("  │  Kizuna ACO Worker " + WORKER_VERSION.padEnd(38) + "│");
   console.log("  └" + "─".repeat(58) + "┘");
 
-  if (!CONFIG.RPC_URL) {
-    console.error("  ✗ RPC_URL belum di-set di aco-worker/.env");
-    process.exit(1);
-  }
-
   if (supabaseConfigError) {
     console.error(`  ✗ ${supabaseConfigError}`);
     process.exit(1);
   }
-
-  if (!hasOpenseaApiKey()) {
-    console.error("  ✗ OPENSEA_API_KEY belum di-set di aco-worker/.env");
-    process.exit(1);
-  }
-  console.log("  ✓ OPENSEA_API_KEY ada");
 
   try {
     assertEncryptionKeyReady();
@@ -480,17 +576,46 @@ async function main() {
   }
   console.log("  ✓ Supabase tersambung");
 
-  try {
-    const probe = CONFIG.RPC_URL.startsWith("ws")
-      ? new ethers.WebSocketProvider(CONFIG.RPC_URL)
-      : new ethers.JsonRpcProvider(CONFIG.RPC_URL);
-    const net = await probe.getNetwork();
-    console.log(`  ✓ RPC tersambung · chainId ${net.chainId}`);
-    await probe.destroy?.();
-  } catch (err) {
-    console.error(`  ✗ RPC gagal: ${err.message}`);
-    process.exit(1);
+  // API key OpenSea sekarang per user (dibuat dari browser user saat login),
+  // jadi tidak ada satu key global yang bisa dicek di sini. Yang diperiksa:
+  // apakah jalur pengambilannya terkonfigurasi.
+  if (process.env.WEBSITE_URL && process.env.WORKER_SHARED_SECRET) {
+    console.log("  ✓ Jalur API key ke website terkonfigurasi");
+  } else {
+    console.log(
+      "  ⚠ WEBSITE_URL / WORKER_SHARED_SECRET belum di-set — worker akan baca\n" +
+        "    key langsung dari database (masih jalan, tapi tanpa jalur utama)."
+    );
   }
+
+  // Uji RPC tiap chain. Ini yang paling sering jadi sumber masalah, jadi
+  // dilaporkan per chain, bukan sekadar satu RPC global.
+  console.log("");
+  console.log("  RPC per chain:");
+  for (const c of SUPPORTED_CHAINS) {
+    const url = c.defaultRpc || CONFIG.RPC_URL;
+    if (!url) {
+      console.log(`    ✗ ${c.label.padEnd(14)} tidak ada RPC`);
+      continue;
+    }
+    try {
+      const probe = url.startsWith("ws")
+        ? new ethers.WebSocketProvider(url)
+        : new ethers.JsonRpcProvider(url);
+      const net = await probe.getNetwork();
+      const match = Number(net.chainId) === c.chainId;
+      console.log(
+        `    ${match ? "✓" : "✗"} ${c.label.padEnd(14)} chainId ${net.chainId}` +
+          (match ? "" : ` — TIDAK COCOK, seharusnya ${c.chainId}`)
+      );
+      await probe.destroy?.();
+    } catch (err) {
+      console.log(`    ✗ ${c.label.padEnd(14)} ${String(err.message).slice(0, 50)}`);
+    }
+  }
+  console.log("");
+  console.log("  Catatan: RPC publik di atas rate-limit-nya ketat. Untuk mint");
+  console.log("  kompetitif, user sebaiknya simpan RPC sendiri di halaman /aco.");
 
   if (checkOnly) {
     console.log("");

@@ -1,34 +1,49 @@
 import { ethers } from "ethers";
-import fetch from "node-fetch";
+// limitedFetch: login SIWE banyak wallet berbarengan gampang kena 429 di
+// opensea.io. Rate limiter memberi jeda otomatis, bukan menggagalkan.
+import { limitedFetch as fetch } from "./rateLimiter.js";
 import "dotenv/config";
 
 const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY || "";
 
-// PERUBAHAN dari versi CLI: dulu ini `throw` di top-level module. Di worker,
-// throw saat import bikin seluruh proses mati dengan stack trace panjang
-// sebelum pemeriksaan env lain sempat jalan. Sekarang dicek di dalam fungsi,
-// jadi worker.js bisa melaporkan env yang kurang dengan pesan yang jelas.
-function requireApiKey() {
-  if (!OPENSEA_API_KEY) {
-    throw new Error("OPENSEA_API_KEY belum di-set di aco-worker/.env");
+// PERUBAHAN dari versi CLI: API key tidak lagi dibaca dari env saja.
+// Sekarang bisa dikirim sebagai argumen (dari lib/openseaKey.js yang mengambil
+// key terkelola dari website), dengan env sebagai cadangan. Alasannya: key
+// OpenSea kedaluwarsa 30 hari dan dirotasi otomatis, jadi menuliskannya di
+// .env berarti harus diedit manual tiap kali rotasi.
+//
+// Pemeriksaan juga dipindah dari top-level ke dalam fungsi — throw saat import
+// mematikan proses dengan stack trace sebelum worker bisa melaporkan env mana
+// yang kurang.
+function resolveApiKey(apiKey) {
+  const key = apiKey || OPENSEA_API_KEY;
+  if (!key) {
+    throw new Error(
+      "API key OpenSea tidak tersedia. Cek WEBSITE_URL + WORKER_SHARED_SECRET, " +
+        "atau isi OPENSEA_API_KEY di aco-worker/.env"
+    );
   }
+  return key;
 }
 
 export const hasOpenseaApiKey = () => Boolean(OPENSEA_API_KEY);
 
+function buildHeaders(apiKey) {
+  return { ...BASE_HEADERS, "x-api-key": resolveApiKey(apiKey) };
+}
+
 const BASE_HEADERS = {
   "content-type": "application/json",
-  "x-api-key": OPENSEA_API_KEY,
   "origin": "https://opensea.io",
   "referer": "https://opensea.io/",
   "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
 };
 
-async function getNonce(address) {
+async function getNonce(address, apiKey) {
   const checksumAddress = ethers.getAddress(address);
   const res = await fetch("https://opensea.io/__api/auth/siwe/nonce", {
     method: "POST",
-    headers: BASE_HEADERS,
+    headers: buildHeaders(apiKey),
     body: JSON.stringify({ address: checksumAddress }),
   });
   const text = await res.text();
@@ -64,7 +79,7 @@ function buildSiweMessage({ address, nonce, chainId }) {
   return { message, fields };
 }
 
-async function verifySiwe(fields, signature) {
+async function verifySiwe(fields, signature, apiKey) {
   const body = {
     message: {
       domain: fields.domain,
@@ -82,7 +97,7 @@ async function verifySiwe(fields, signature) {
   };
   const res = await fetch("https://opensea.io/__api/auth/siwe/verify", {
     method: "POST",
-    headers: BASE_HEADERS,
+    headers: buildHeaders(apiKey),
     body: JSON.stringify(body),
   });
   const text = await res.text();
@@ -115,20 +130,21 @@ async function verifySiwe(fields, signature) {
 
 // onStatus callback: (status) => void
 // status: 'nonce' | 'signed' | 'success' | 'error'
-export async function siweLogin(privateKey, chainId = 1, onStatus = null) {
-  requireApiKey();
-
+//
+// apiKey: kalau diisi, dipakai menggantikan OPENSEA_API_KEY dari env. Worker
+// mengisinya dengan key terkelola dari website (lihat lib/openseaKey.js).
+export async function siweLogin(privateKey, chainId = 1, onStatus = null, apiKey = null) {
   const wallet  = new ethers.Wallet(privateKey);
   const address = wallet.address;
 
   onStatus?.("nonce");
-  const nonce = await getNonce(address);
+  const nonce = await getNonce(address, apiKey);
 
   onStatus?.("signed");
   const { message, fields } = buildSiweMessage({ address, nonce, chainId });
   const signature = await wallet.signMessage(ethers.toUtf8Bytes(message));
 
-  const cookies = await verifySiwe(fields, signature);
+  const cookies = await verifySiwe(fields, signature, apiKey);
 
   onStatus?.("success");
 

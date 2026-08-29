@@ -1,5 +1,9 @@
-import fetch from "node-fetch";
 import { ethers } from "ethers";
+// PERUBAHAN dari versi CLI: fetch biasa diganti limitedFetch supaya request ke
+// gql.opensea.io lewat token bucket dan menghormati Retry-After saat 429.
+// Tanpa ini, hammer calldata (300x @200ms x jumlah wallet) memicu rate limit
+// yang justru membuat semua wallet gagal.
+import { limitedFetch as fetch } from "./rateLimiter.js";
 
 const GQL_ENDPOINT = "https://gql.opensea.io/graphql";
 
