@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getAuthContext, buildDenial } from "@/lib/apiAuth";
+import { isSupportedChain, getChain } from "@/lib/chains";
 
 const GQL_ENDPOINT = "https://gql.opensea.io/graphql";
 
@@ -107,13 +108,21 @@ export async function GET(req) {
   }
 
   const stages = collection.drop?.stages || [];
+  const chainIdentifier = collection.chain?.identifier || null;
+  const chainInfo = getChain(chainIdentifier);
 
   return NextResponse.json({
     data: {
       slug,
       name: collection.name || slug,
       contractAddress: collection.address || null,
-      chain: collection.chain?.identifier || null,
+      chain: chainIdentifier,
+      // Chain dideteksi dari OpenSea, bukan dipilih user — supaya tidak
+      // mungkin ada job yang chain-nya tidak cocok dengan collection-nya.
+      chainId: chainInfo?.chainId ?? null,
+      chainLabel: chainInfo?.label ?? chainIdentifier,
+      chainSymbol: chainInfo?.symbol ?? "ETH",
+      chainSupported: chainIdentifier ? isSupportedChain(chainIdentifier) : false,
       stages: stages.map((s) => ({
         stageIndex: s.stageIndex,
         label: s.label,

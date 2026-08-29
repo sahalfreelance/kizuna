@@ -10,22 +10,27 @@ create extension if not exists "pgcrypto";
 
 -- ------------------------------------------------- platform di aco_jobs
 --
--- ACO sekarang untuk OpenSea. Scatter dan mint-by-contract menyusul, jadi
--- kolomnya disiapkan sekarang supaya job lama tidak perlu dimigrasi lagi.
+-- ACO sekarang untuk OpenSea. Mintbay, Scatter, dan mint-by-contract menyusul,
+-- jadi kolomnya disiapkan sekarang supaya job lama tidak perlu dimigrasi lagi.
 --
 alter table aco_jobs
   add column if not exists platform text not null default 'opensea';
 
 -- Constraint dipasang terpisah supaya migration aman diulang.
+-- Kalau constraint lama sudah ada (daftar platform lebih sedikit), dilepas
+-- dulu lalu dipasang ulang — supaya menambah platform tidak perlu migration
+-- baru dari nol.
 do $$
 begin
-  if not exists (
+  if exists (
     select 1 from pg_constraint where conname = 'aco_jobs_platform_check'
   ) then
-    alter table aco_jobs
-      add constraint aco_jobs_platform_check
-      check (platform in ('opensea', 'scatter', 'contract'));
+    alter table aco_jobs drop constraint aco_jobs_platform_check;
   end if;
+
+  alter table aco_jobs
+    add constraint aco_jobs_platform_check
+    check (platform in ('opensea', 'mintbay', 'scatter', 'contract'));
 end $$;
 
 create index if not exists aco_jobs_platform_idx on aco_jobs (platform, created_at desc);

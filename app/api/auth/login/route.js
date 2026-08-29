@@ -247,6 +247,17 @@ export async function POST(req) {
     user_agent: userAgent,
   });
 
+  // Refresh API key OpenSea SUDAH TIDAK dilakukan di sini.
+  //
+  // Alasannya: endpoint pembuatan key OpenSea dibatasi 2 key/hari PER IP.
+  // Kalau server yang meminta, semua user berbagi kuota IP server — habis
+  // setelah 2 user. Sekarang permintaan dilakukan dari BROWSER user
+  // (components/LoginForm.js -> lib/openseaKeyClient.js), jadi kuota terpakai
+  // dari IP masing-masing user dan tiap user punya key sendiri.
+  //
+  // Key per user juga menghilangkan bentrok rate limit saat beberapa user
+  // menjalankan mint bersamaan.
+
   const res = NextResponse.json({
     user: {
       id: user.id,

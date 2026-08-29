@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+import { ensureUserOpenseaKey } from "@/lib/openseaKeyClient";
 
 const DEVICE_KEY = "kizuna_device_id";
 
@@ -96,6 +97,21 @@ export default function LoginForm({ callbackUrl = "/" }) {
         setError(json.error || "Login gagal. Coba lagi.");
         setErrorCode(json.code || null);
         return;
+      }
+
+      // Refresh API key OpenSea milik user ini. DIPANGGIL DARI BROWSER, bukan
+      // server: kuota pembuatan key 2/hari per IP, jadi kalau server yang
+      // minta, semua user berbagi kuota IP server dan cepat habis.
+      //
+      // Hasilnya tidak memblokir login — kalau gagal, user tetap masuk dan
+      // bisa refresh manual dari halaman /aco.
+      try {
+        const keyResult = await ensureUserOpenseaKey();
+        if (keyResult.action !== "kept") {
+          console.log(`[login] opensea key: ${keyResult.action} — ${keyResult.reason}`);
+        }
+      } catch {
+        /* jangan sampai menggagalkan login */
       }
 
       // Cookie httpOnly sudah di-set server. refresh() supaya server component

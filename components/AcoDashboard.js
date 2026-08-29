@@ -964,17 +964,20 @@ function PlatformComingSoon({ platform }) {
         <div>· Anti-revert (simulasi sebelum kirim)</div>
         <div>· Auto-retry dengan klasifikasi error</div>
         <div>· Anti rate-limit (token bucket per host)</div>
-        {platform.needsAbi && (
-          <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px solid var(--border)", color: "var(--live)" }}>
-            Yang masih perlu dibangun: penyusun calldata dari ABI. Tiap kontrak
-            beda nama fungsi dan argumennya, jadi tidak bisa dideteksi otomatis
-            seperti OpenSea — user harus memberi ABI dan argumennya sendiri.
-          </div>
-        )}
-        {!platform.needsAbi && platform.id === "scatter" && (
-          <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px solid var(--border)", color: "var(--live)" }}>
-            Yang masih perlu dibangun: pemetaan endpoint Scatter untuk mengambil
-            jadwal stage dan calldata mint.
+
+        {/* Deskripsi pekerjaan yang tersisa datang dari lib/platforms.js,
+            bukan hardcode di sini — supaya menambah platform cuma perlu
+            mengubah registry. */}
+        {platform.pendingWork && (
+          <div
+            style={{
+              marginTop: 8,
+              paddingTop: 8,
+              borderTop: "1px solid var(--border)",
+              color: "var(--live)",
+            }}
+          >
+            Yang masih perlu dibangun: {platform.pendingWork}
           </div>
         )}
       </div>
