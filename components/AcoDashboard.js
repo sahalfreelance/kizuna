@@ -1,6 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useConfirm } from "@/components/ConfirmDialog";
+import MintedItems from "@/components/MintedItems";
+import { explorerTxUrl } from "@/lib/chains";
 
 /* --------------------------------------------------------------- gaya dasar */
 
@@ -178,7 +181,7 @@ function OpenseaKeyPanel() {
 
 /* ======================================================== RPC MANAGER */
 
-function RpcManager({ chains, onChange }) {
+function RpcManager({ chains, onChange, ask }) {
   const [openChain, setOpenChain] = useState(null);
   const [url, setUrl] = useState("");
   const [busy, setBusy] = useState(false);
@@ -211,9 +214,14 @@ function RpcManager({ chains, onChange }) {
   }
 
   async function remove(chain) {
-    if (!confirm(`Hapus RPC custom untuk ${chain}?\n\nChain ini akan kembali pakai RPC publik.`)) {
-      return;
-    }
+    const yes = await ask({
+      title: "Hapus RPC custom",
+      message: `Hapus RPC custom untuk ${chain}?`,
+      detail: "Chain ini akan kembali memakai RPC publik yang rate-limitnya lebih ketat.",
+      confirmLabel: "hapus",
+    });
+    if (!yes) return;
+
     await fetch(`/api/aco/rpcs?chain=${encodeURIComponent(chain)}`, { method: "DELETE" });
     onChange();
   }
@@ -365,7 +373,7 @@ function countdown(iso) {
 
 /* ======================================================== WALLET MANAGER */
 
-function WalletManager({ wallets, limit, onChange }) {
+function WalletManager({ wallets, limit, onChange, ask }) {
   const [privateKey, setPrivateKey] = useState("");
   const [walletLabel, setWalletLabel] = useState("");
   const [busy, setBusy] = useState(false);
@@ -405,9 +413,17 @@ function WalletManager({ wallets, limit, onChange }) {
   }
 
   async function removeWallet(id, address) {
-    if (!confirm(`Hapus wallet ${short(address)}?\n\nPrivate key-nya akan dihapus dari database.`)) {
-      return;
-    }
+    const yes = await ask({
+      title: "Hapus wallet",
+      message: `Hapus wallet ${short(address)}?`,
+      detail:
+        "Private key-nya dihapus permanen dari database. Kalau lu belum simpan " +
+        "cadangannya di tempat lain, wallet ini tidak bisa dipulihkan dari sini.",
+      confirmLabel: "hapus permanen",
+      danger: true,
+    });
+    if (!yes) return;
+
     await fetch(`/api/aco/wallets/${id}`, { method: "DELETE" });
     onChange();
   }
@@ -1333,7 +1349,7 @@ function PlatformComingSoon({ platform }) {
 
 /* ============================================================= JOB DETAIL */
 
-function JobDetail({ jobId, onClose, onChanged }) {
+function JobDetail({ jobId, onClose, onChanged, ask }) {
   const [job, setJob] = useState(null);
   const [logs, setLogs] = useState([]);
   const [attempts, setAttempts] = useState([]);
@@ -1386,7 +1402,18 @@ function JobDetail({ jobId, onClose, onChanged }) {
   const canCancel = ["QUEUED", "CLAIMED"].includes(job.status);
 
   async function cancel() {
-    if (!confirm("Batalkan job ini?")) return;
+    const yes = await ask({
+      title: "Batalkan job",
+      message: `Batalkan job untuk ${job.slug}?`,
+      detail:
+        job.status === "CLAIMED"
+          ? "Worker sedang memproses job ini. Pembatalan berlaku sebelum tx dikirim; kalau tx sudah terkirim, ia tidak bisa ditarik kembali."
+          : "Job dikeluarkan dari antrean dan tidak akan dieksekusi.",
+      confirmLabel: "batalkan job",
+      danger: true,
+    });
+    if (!yes) return;
+
     await fetch(`/api/aco/jobs/${job.id}`, { method: "DELETE" });
     poll();
     onChanged();
@@ -1460,34 +1487,45 @@ function JobDetail({ jobId, onClose, onChanged }) {
                 </span>
                 <span style={{ color: "var(--indigo-dim)" }}>{short(r.address)}</span>
                 {r.txHash ? (
-                  <a
-                    href={
-                      job.chain === "base" ? `https://basescan.org/tx/${r.txHash}`
-                      : job.chain === "arbitrum" ? `https://arbiscan.io/tx/${r.txHash}`
-                      : job.chain === "optimism" ? `https://optimistic.etherscan.io/tx/${r.txHash}`
-                      : job.chain === "polygon" ? `https://polygonscan.com/tx/${r.txHash}`
-                      : job.chain === "zora" ? `https://explorer.zora.energy/tx/${r.txHash}`
-                      : job.chain === "blast" ? `https://blastscan.io/tx/${r.txHash}`
-                      : job.chain === "avalanche" ? `https://snowtrace.io/tx/${r.txHash}`
-                      : job.chain === "sei" ? `https://seitrace.com/tx/${r.txHash}`
-                      : job.chain === "ape_chain" ? `https://apescan.io/tx/${r.txHash}`
-                      : job.chain === "ronin" ? `https://app.roninchain.com/tx/${r.txHash}`
-                      : job.chain === "ink" ? `https://explorer.inkonchain.com/tx/${r.txHash}`
-                      : job.chain === "robinhood" ? `https://robinhoodchain.blockscout.com/tx/${r.txHash}`
-                      : `https://etherscan.io/tx/${r.txHash}`
-                    }
-                    target="_blank"
-                    rel="noreferrer"
-                    style={{ color: "var(--text-mid)", textDecoration: "underline" }}
-                  >
-                    {short(r.txHash)}
-                  </a>
+                  <>
+                    {/* URL explorer diambil dari lib/chains supaya tidak ada
+                        daftar hardcode yang harus diedit tiap tambah chain. */}
+                    <a
+                      href={explorerTxUrl(job.chain, r.txHash) || "#"}
+                      target="_blank"
+                      rel="noreferrer"
+                      style={{ color: "var(--text-mid)", textDecoration: "underline" }}
+                    >
+                      {short(r.txHash)}
+                    </a>
+                    {r.tokenCount > 0 && (
+                      <span style={{ color: "var(--crypto)" }}>{r.tokenCount} item</span>
+                    )}
+                    {r.blockNumber && (
+                      <span style={{ color: "var(--text-dim)", fontSize: 9.5 }}>
+                        blk {r.blockNumber}
+                      </span>
+                    )}
+                    {r.gasUsed && (
+                      <span style={{ color: "var(--text-dim)", fontSize: 9.5 }}>
+                        gas {Number(r.gasUsed).toLocaleString("id-ID")}
+                      </span>
+                    )}
+                  </>
                 ) : (
                   <span style={{ color: "var(--text-dim)" }}>{r.error}</span>
                 )}
               </div>
             ))}
           </div>
+
+          {/* Galeri NFT hasil mint. Datanya dari log transaksi di chain, jadi
+              token id selalu ada walau gambarnya belum terindeks OpenSea. */}
+          <MintedItems
+            items={job.preflight?.items}
+            chain={job.chain}
+            txHash={job.result_summary?.find((r) => r.success)?.txHash}
+          />
 
           {/* Ringkasan pengaman. `prevented` BUKAN kegagalan — itu gas yang
               berhasil diselamatkan sebelum tx dikirim. */}
@@ -1636,6 +1674,10 @@ export default function AcoDashboard() {
   const [openJob, setOpenJob] = useState(null);
   const [loaded, setLoaded] = useState(false);
 
+  // Dialog konfirmasi bertema, pengganti window.confirm() bawaan browser.
+  // `dialog` harus dirender sekali di sini; `ask` diteruskan ke anak-anaknya.
+  const { ask, dialog } = useConfirm();
+
   const loadWallets = useCallback(async () => {
     const res = await fetch("/api/aco/wallets", { cache: "no-store" });
     if (res.ok) {
@@ -1702,6 +1744,9 @@ export default function AcoDashboard() {
 
   return (
     <main style={{ maxWidth: 1400, margin: "0 auto", padding: "22px 20px 60px" }}>
+      {/* Dialog konfirmasi — dirender sekali, dikendalikan lewat ask(). */}
+      {dialog}
+
       <div style={{ marginBottom: 14 }}>
         <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
           <h1 style={{ fontSize: 17, fontWeight: 700, letterSpacing: 1, color: "var(--text)" }}>
@@ -1771,9 +1816,9 @@ export default function AcoDashboard() {
         }}
       >
         <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-          <WalletManager wallets={wallets} limit={walletLimit} onChange={loadWallets} />
+          <WalletManager wallets={wallets} limit={walletLimit} onChange={loadWallets} ask={ask} />
           <OpenseaKeyPanel />
-          <RpcManager chains={chains} onChange={loadChains} />
+          <RpcManager chains={chains} onChange={loadChains} ask={ask} />
         </div>
 
         <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
@@ -1786,6 +1831,7 @@ export default function AcoDashboard() {
               jobId={openJob}
               onClose={() => setOpenJob(null)}
               onChanged={loadJobs}
+              ask={ask}
             />
           ) : (
             <JobCreator

@@ -17,7 +17,8 @@
 import { preflight } from "./simulate.js";
 import { withRetry, classifyError, traitsOf, ErrorKind } from "./retry.js";
 import { fetchCalldataWithRetry } from "./graphql.js";
-import { waitForMintStatus } from "./mint.js";
+import { confirmOnChain } from "./confirmChain.js";
+import { fetchMintedItems } from "./itemDetail.js";
 
 /** Catat satu percobaan ke aco_attempts untuk audit. */
 async function recordAttempt(supabase, row) {
@@ -175,16 +176,41 @@ export async function mintWalletGuarded({
           duration_ms: Date.now() - t0,
         });
 
-        // ---- 4. Tunggu status ---------------------------------------------
-        const receipt = await waitForMintStatus(
+        // ---- 4. Konfirmasi dari CHAIN, bukan dari OpenSea -------------------
+        //
+        // PERUBAHAN PENTING. Dulu status dibaca dari gql.opensea.io. Itu bikin
+        // mint yang SUKSES dilaporkan gagal cuma karena OpenSea kena 429:
+        //
+        //   OK    Tx dikirim: 0x4e43…1d5e
+        //   WARN  Percobaan 1 gagal (RATE_LIMIT): 429 (gql.opensea.io)
+        //   OK    Selesai — 0/1 wallet berhasil mint     ← padahal minted
+        //
+        // Receipt dari chain tidak bisa kena rate limit OpenSea dan hasilnya
+        // pasti. OpenSea sekarang cuma dipakai untuk melengkapi nama/gambar
+        // SETELAH status sudah pasti.
+        const chainResult = await confirmOnChain(
+          pool,
           tx.hash,
+          address,
           contractAddress,
-          chain,
-          job.price_unit || "0",
-          cookieStr
+          { log }
         );
 
-        const success = receipt?.status === "SUCCESS";
+        const success = chainResult.success;
+
+        // Detail item (nama + gambar). Kegagalan di sini tidak mengubah status.
+        let items = [];
+        if (success && chainResult.tokens.length > 0) {
+          try {
+            items = await fetchMintedItems(chainResult.tokens, chain, apiKey, { log });
+          } catch (err) {
+            await log.warn(
+              `Detail item tidak bisa diambil: ${String(err.message).slice(0, 100)}`,
+              address
+            );
+            items = chainResult.tokens.map((t) => ({ ...t, name: null, imageUrl: null }));
+          }
+        }
 
         await recordAttempt(supabase, {
           job_id: job.id,
@@ -193,16 +219,44 @@ export async function mintWalletGuarded({
           outcome: success ? "SUCCESS" : "REVERTED",
           tx_hash: tx.hash,
           rpc_host: entry.host,
+          gas_used: chainResult.gasUsed ? Number(chainResult.gasUsed) : null,
           duration_ms: Date.now() - t0,
         });
 
         if (success) {
-          await log.ok(`Mint SUKSES · tx ${tx.hash}`, address);
+          const jumlah = chainResult.tokens.reduce((n, t) => n + (t.quantity || 1), 0);
+          await log.ok(
+            `Mint SUKSES · ${jumlah} item · block ${chainResult.blockNumber} · tx ${tx.hash}`,
+            address
+          );
+          for (const it of items) {
+            await log.ok(
+              `Dapat: ${it.name || `#${it.tokenId}`}${it.imageUrl ? " (gambar tersedia)" : ""}`,
+              address
+            );
+          }
+          if (chainResult.reason) await log.warn(chainResult.reason, address);
+        } else if (chainResult.confirmed) {
+          await log.error(`Mint gagal: ${chainResult.reason}`, address);
         } else {
-          await log.error(`Mint gagal menurut OpenSea (${receipt?.status})`, address);
+          // Belum terkonfirmasi — JANGAN retry, tx sudah di jaringan.
+          await log.warn(
+            `Tx terkirim tapi belum terkonfirmasi: ${chainResult.reason}`,
+            address
+          );
         }
 
-        return { address, success, txHash: tx.hash, rpcHost: entry.host };
+        return {
+          address,
+          success,
+          txHash: tx.hash,
+          rpcHost: entry.host,
+          blockNumber: chainResult.blockNumber ?? null,
+          gasUsed: chainResult.gasUsed ?? null,
+          unconfirmed: !chainResult.confirmed,
+          items,
+          tokenCount: chainResult.tokens.reduce((n, t) => n + (t.quantity || 1), 0),
+        };
       },
       {
         maxAttempts: Math.max(1, Math.min(job.max_attempts || 3, 10)),

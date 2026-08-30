@@ -175,6 +175,28 @@ export async function withRetry(fn, opts = {}) {
       return result;
     } catch (err) {
       lastError = err;
+
+      // Tx SUDAH TERKIRIM — hentikan segera, jangan diklasifikasi ulang.
+      //
+      // Ini pelajaran dari log user: setelah tx terkirim, pembacaan status
+      // gagal (429), lalu percobaan 2 dan 3 dijalankan dan langsung menabrak
+      // guard `sentTxHash` — menghasilkan dua WARN yang tidak berguna dan
+      // membuang ~1,7 detik. Errornya diklasifikasi UNKNOWN (retryable)
+      // padahal jelas tidak boleh diulang.
+      if (err?.alreadySent) {
+        err.errorKind = ErrorKind.TX_SENT_UNKNOWN;
+        err.unsafeToRetry = true;
+        await onEvent?.({
+          type: "error",
+          attempt,
+          kind: ErrorKind.TX_SENT_UNKNOWN,
+          traits: traitsOf(ErrorKind.TX_SENT_UNKNOWN),
+          message: err?.message ?? String(err),
+          label,
+        });
+        throw err;
+      }
+
       const kind = classifyError(err);
       const traits = traitsOf(kind);
 

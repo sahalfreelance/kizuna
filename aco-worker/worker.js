@@ -46,7 +46,7 @@ const CONFIG = {
 // masih OPEN mint tetap bisa dieksekusi. Sekarang yang menentukan adalah waktu
 // TUTUP stage. Kalau env MAX_LATE_MS masih ada di .env, diabaikan saja.
 
-const WORKER_VERSION = "v4";
+const WORKER_VERSION = "v5";
 
 // SIWE login memakan ~2 detik per wallet. Untuk mint yang menang-kalahnya
 // hitungan detik, itu mahal. Session dipanaskan lebih awal: dimulai
@@ -619,6 +619,13 @@ async function processJob(job) {
     const preventedCount = results.filter((r) => r.prevented).length;
     const unconfirmedCount = results.filter((r) => r.unconfirmed).length;
 
+    // Semua item hasil mint dikumpulkan supaya UI bisa menampilkannya tanpa
+    // menelusuri per wallet.
+    const allItems = results.flatMap((r) =>
+      (r.items ?? []).map((it) => ({ ...it, wallet: r.address }))
+    );
+    const totalItems = results.reduce((n, r) => n + (r.tokenCount || 0), 0);
+
     await setJobStatus(job.id, {
       status: "DONE",
       finished_at: new Date().toISOString(),
@@ -626,12 +633,17 @@ async function processJob(job) {
       preflight: {
         prevented: preventedCount,
         unconfirmed: unconfirmedCount,
+        totalItems,
+        items: allItems,
         rpc: pool.summary(),
         rateLimit: statsSnapshot(),
       },
     });
 
     let ringkasan = `Selesai — ${successCount}/${results.length} wallet berhasil mint`;
+    if (totalItems > 0) {
+      ringkasan += ` · ${totalItems} item didapat`;
+    }
     if (preventedCount > 0) {
       // Ini bukan kegagalan: gas berhasil diselamatkan.
       ringkasan += ` · ${preventedCount} dicegah sebelum kirim (gas aman)`;
