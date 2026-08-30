@@ -3,25 +3,23 @@
 Login username+password, ACO multi-platform, eligibility checker, worker VPS.
 Struktur folder sudah sama dengan repo — tinggal `cp -r`.
 
-Paket ini **menggantikan semua zip sebelumnya**. Aman ditimpa.
-
-72 file. Tidak ada `.env`, tidak ada `node_modules`.
+Menggantikan semua zip sebelumnya. 74 file, tanpa `.env`/`node_modules`.
 
 ---
 
-## ⚠ Yang berubah di update ini
+## ⚠ Update ini: job jalan BERSAMAAN
 
-**1. Status mint sekarang dibaca dari CHAIN, bukan dari OpenSea.** Job lu
-dilaporkan `0/1 berhasil` padahal NFT-nya **benar-benar ter-mint**. Gw buktikan
-dari tx lu sendiri (rincian di bawah).
+**Jawaban pertanyaan lu: iya, dulu mengantre. Sekarang tidak.**
 
-**2. Detail + gambar NFT hasil mint** ditampilkan di panel job.
+Ada 3 masalah yang gw temukan dan perbaiki:
 
-**3. Dialog konfirmasi** tidak lagi pakai `window.confirm()` bawaan browser.
+1. **Job diproses satu per satu.** Karena job menunggu window mint (bisa
+   berjam-jam), job lain tertahan di antrean sampai jadwalnya kelewat.
+2. **Job yang sedang menunggu dibunuh sendiri** setelah 30 menit. Artinya
+   menjadwalkan mint lebih dari 30 menit di depan **tidak pernah bisa berhasil**.
+3. **Dua job dengan wallet sama bisa saling menimpa tx.**
 
-**4. Retry sia-sia dihentikan** — percobaan 2 & 3 di log lu tidak akan terjadi lagi.
-
-Worker naik ke **v5**. Wajib restart. **Tidak ada migration baru.**
+Worker naik ke **v6**. **Ada migration baru.**
 
 ---
 
@@ -36,7 +34,15 @@ npm install
 cd aco-worker && npm install && cd ..
 ```
 
-Build dulu:
+**Migration WAJIB** di Supabase SQL Editor:
+
+```
+supabase/migration_aco_parallel.sql
+```
+
+Tanpa ini worker tetap jalan tapi **masih sequential**, dan pembersihan job mati
+dilewati (sengaja — mekanisme lamanya justru membunuh job yang sedang menunggu).
+`node worker.js --check` akan memberi tahu kalau belum dijalankan.
 
 ```bash
 NEXT_PUBLIC_SUPABASE_URL="https://dummy.supabase.co" \
@@ -45,153 +51,119 @@ AUTH_SESSION_SECRET="dummy-panjang-sekali" \
 WALLET_ENCRYPTION_KEY="$(openssl rand -base64 32)" \
 WORKER_SHARED_SECRET="dummy" \
 npx next build
-```
 
-Harus `✓ Compiled successfully`.
-
-```bash
 git add -A
 git status --short | grep -E "\.env$|node_modules" && echo "STOP" || echo "aman"
-git commit -m "feat(aco): konfirmasi on-chain + galeri item + dialog bertema"
+git commit -m "feat(aco): job paralel + heartbeat + kunci nonce per wallet"
 git push origin main
 
+cd aco-worker && node worker.js --check && cd ..
 pm2 restart kizuna-aco-worker
 pm2 logs kizuna-aco-worker --lines 20
 ```
 
-Log harus **`Kizuna ACO Worker v5`**.
+`--check` harus menampilkan `✓ Job paralel siap (maks 8 bersamaan)`, dan log
+harus **`Kizuna ACO Worker v6`**.
 
 ---
 
-## Perbaikan 1: status dibaca dari chain
+## Masalah 1: antrean
 
-Log lu:
+Kode lamanya:
 
-```
-OK    Tx dikirim: 0x4e43…1d5e
-WARN  Percobaan 1 gagal (RATE_LIMIT): 429 Too Many Requests (gql.opensea.io)
-WARN  Percobaan 2 gagal (UNKNOWN): Tx sudah terkirim
-WARN  Percobaan 3 gagal (UNKNOWN): Tx sudah terkirim
-OK    Selesai — 0/1 wallet berhasil mint · 1 tx perlu dicek manual
+```js
+const job = await claimNextJob();
+if (job) await processJob(job);   // ← memblokir sampai selesai
 ```
 
-Gw baca tx lu langsung dari Robinhood Chain:
+Skenario yang bikin kacau:
 
 ```
-status     : 1 (SUKSES)
-block      : 49464109
-gasUsed    : 128836
-token masuk: 2 (#600, #601 ERC721)
+Job A: mint 20:00  → diambil 14:00, TIDUR 6 jam di dalam processJob
+Job B: mint 14:30  → nunggu di QUEUED… kelewat, gagal
+Job C: user lain   → sama, kelewat
 ```
 
-Mint-nya **berhasil**. Yang gagal cuma pembacaan status dari `gql.opensea.io`
-karena kena rate limit — dan itu dilaporkan sebagai mint gagal.
+Sekarang `processJob` tidak di-`await` di loop — ia jalan di latar, jadi loop
+langsung mengambil job berikutnya. Sampai **8 job bersamaan** (bisa diubah lewat
+`MAX_CONCURRENT_JOBS`).
 
-Sekarang status ditentukan dari **receipt transaksi**: tidak bisa kena rate limit
-OpenSea, tidak butuh cookie, hasilnya pasti. Token yang masuk dihitung dari event
-`Transfer`/`TransferSingle`/`TransferBatch` dari address nol ke wallet lu.
+Aman dijalankan bersamaan karena beban tiap job hampir nol saat menunggu; yang
+padat cuma detik-detik mint, dan itu sudah dijaga rate limiter per-host.
 
-OpenSea sekarang cuma dipakai untuk melengkapi nama & gambar, **setelah** status
-sudah pasti. Kalau OpenSea kena 429, yang hilang cuma gambar — bukan status.
+**Urutan pengambilan juga diperbaiki.** Dulu urut `created_at` — job yang dibuat
+lebih dulu diambil lebih dulu, walau jadwalnya jauh. Sekarang urut
+`stage_start_time`: job yang mau mint 10 menit lagi menang dari job yang mau mint
+6 jam lagi.
 
-### Temuan sampingan
+Klaim job dipindah ke fungsi Postgres dengan `for update skip locked`, jadi
+pengambilan paralel tidak bisa bertabrakan.
 
-Contract address dari OpenSea (`0x5cae…328e`) **berbeda** dari kontrak yang
-benar-benar me-mint NFT lu (`0x4997…5390`). Ini normal di SeaDrop: alamat yang
-dipanggil dan kontrak NFT bisa beda.
+Diuji dengan simulasi 3 job:
 
-Kalau log difilter ketat ke alamat OpenSea, hasilnya **0 token** padahal 2 token
-masuk. Jadi filter dipakai sebagai preferensi: kalau tidak ada yang cocok, semua
-mint ke wallet lu diterima.
+```
+SEQUENTIAL (lama)  A=632ms  B=762ms KELEWAT  C=943ms KELEWAT   → 2/3 kelewat
+PARALEL (baru)     A=631ms  B=131ms          C=181ms           → 0/3 kelewat
+```
 
 ---
 
-## Perbaikan 2: retry sia-sia dihentikan
+## Masalah 2: job dibunuh saat menunggu
 
-Percobaan 2 dan 3 di log lu langsung menabrak guard "tx sudah terkirim" —
-menghasilkan dua WARN tidak berguna dan membuang ~1,7 detik.
+Ini yang lebih berbahaya, dan gw temukan sambil memeriksa pertanyaan lu:
 
-Penyebabnya error `alreadySent` diklasifikasi `UNKNOWN` (retryable). Sekarang
-langsung dikenali sebagai `TX_SENT_UNKNOWN` dan percobaan berhenti seketika.
+```js
+async function releaseStuckJobs() {
+  const cutoff = Date.now() - 30 * 60 * 1000;
+  // CLAIMED/RUNNING lebih tua dari 30 menit → FAILED "job nyangkut"
+```
+
+Job yang **sah sedang menunggu** window 6 jam ke depan ikut dibunuh setelah 30
+menit dan ditandai nyangkut. Jadi mint yang dijadwalkan lebih dari 30 menit di
+depan sebenarnya tidak pernah bisa berhasil — terlepas dari masalah antrean.
+
+Sekarang pakai **heartbeat**: job hidup menandai dirinya tiap 30 detik, dan hanya
+job tanpa kabar 3 menit yang dianggap mati (worker crash / restart). Job yang
+menunggu berjam-jam tidak tersentuh.
 
 ---
 
-## Perbaikan 3: galeri item hasil mint
+## Masalah 3: dua job, satu wallet
 
-Panel job sekarang menampilkan:
+Kalau lu jadwalkan 2 slug dengan wallet yang sama dan windownya bertabrakan,
+keduanya membaca nonce "pending" yang sama, lalu tx kedua **menimpa** tx pertama
+di mempool — satu mint hilang tanpa jejak, gas tetap terbakar.
 
-```
-ITEM YANG DIDAPAT   2 item                              lihat tx ↗
-┌──────────┐ ┌──────────┐
-│ [gambar] │ │ [gambar] │
-│  #600    │ │  #601    │
-│ ERC721   │ │ ERC721   │
-│ opensea↗ │ │ opensea↗ │
-└──────────┘ └──────────┘
-```
+Bagian ambil-nonce → kirim-tx sekarang dikunci **per wallet**. Wallet berbeda
+tidak saling menunggu, jadi mint paralel multi-wallet tetap secepat sebelumnya.
 
-Baris hasil per wallet juga lebih informatif:
-
-```
-OK  0xBD0c…908D  0x4e43…1d5e  2 item  blk 49464109  gas 128.836
-```
-
-Gambar NFT sering di IPFS dan bisa lambat/gagal, jadi tiap kartu punya fallback:
-token id tampil besar, link OpenSea tetap bisa diklik. Token yang baru di-mint
-biasanya belum terindeks OpenSea — itu ditandai "belum terindeks", bukan error.
-
-Daftar URL explorer yang tadinya hardcode di UI sekarang diambil dari
-`lib/chains.js`, jadi menambah chain tidak perlu mengedit UI lagi.
-
----
-
-## Perbaikan 4: dialog konfirmasi bertema
-
-`window.confirm()` dirender browser/OS — tidak bisa diberi tema, dan
-**memblokir thread JS** sehingga log realtime berhenti diperbarui selama dialog
-terbuka.
-
-Diganti `components/ConfirmDialog.js`: tema gelap, font monospace, bar judul
-seperti panel terminal, dot warna (merah untuk aksi destruktif), animasi masuk
-halus. Enter = lanjut, Esc = batal, klik luar = batal.
-
-Pesannya juga diperjelas. Contoh hapus wallet:
-
-> Private key-nya dihapus permanen dari database. Kalau lu belum simpan
-> cadangannya di tempat lain, wallet ini tidak bisa dipulihkan dari sini.
-
-Dan batalkan job saat `CLAIMED`:
-
-> Worker sedang memproses job ini. Pembatalan berlaku sebelum tx dikirim; kalau
-> tx sudah terkirim, ia tidak bisa ditarik kembali.
-
-3 tempat diganti: hapus wallet, hapus RPC custom, batalkan job.
+Diuji: wallet sama berurutan tanpa tumpang tindih, wallet beda paralel (120ms vs
+240ms), error tidak menyebabkan deadlock, tidak ada kebocoran memori.
 
 ---
 
 ## Hasil tes
 
 ```
-tx SUNGGUHAN milik user (Robinhood Chain, block 49464109)
-  status 1 SUKSES, gasUsed 128836 ✓
-  2 token terdeteksi: #600, #601 ERC721 ✓
-  worker LAMA bilang 0/1 · chain bilang SUKSES 2 token ✓
+simulasi loop
+  sequential 2/3 job kelewat · paralel 0/3 ✓
+  paralel 1.5x lebih cepat ✓
 
-extractMintedTokens        9 kasus
-  ERC721 mint ✓  transfer biasa diabaikan ✓
-  mint ke wallet lain diabaikan ✓
-  ERC1155 Single qty 3 ✓  Batch 2 id total qty 7 ✓
-  3 mint sekaligus ✓  log rusak tidak crash ✓
-  kontrak cocok diutamakan, kalau tidak ada → fallback ✓
+kunci per wallet
+  wallet sama = berurutan, tanpa overlap ✓
+  wallet beda = paralel (120ms vs 240ms) ✓
+  error tidak deadlock, lock lepas ✓
+  return value diteruskan ✓
+  50 operasi → 0 entri tersisa (tidak bocor) ✓
 
-fetchMintedItems (token asli user)
-  tanpa API key → fallback ✓
-  2 input → 2 output, semua punya tokenId + openseaUrl ✓
-
-explorerTxUrl              7 chain ✓ (chain tidak dikenal → null)
-build                      ✓ Compiled successfully
-window.confirm tersisa     0
+build              ✓ Compiled successfully
+syntax semua JS    0 gagal
+worker --check     v6, pesan jelas kalau migration belum jalan
 ```
+
+Satu bug gw temukan sendiri saat menguji: kunci wallet awalnya bocor (52 entri
+tersisa setelah 50 operasi) karena `.then()` membuat promise baru tiap dipanggil,
+jadi perbandingan pembersihannya selalu gagal. Sudah diperbaiki — sekarang 0.
 
 ---
 
@@ -199,16 +171,14 @@ window.confirm tersisa     0
 
 Gw **tidak menyentuh database lu dan tidak mengirim transaksi apa pun.**
 
-- **Gambar NFT belum pernah tampil sungguhan.** `api.opensea.io/v2` menolak
-  tanpa API key (401) dari sini, dan token lu belum terindeks. Jalur fallback
-  sudah teruji (token id + link tetap ada); jalur gambar akan terbukti saat lu
-  buka job dengan API key aktif di produksi.
-- **Dialog konfirmasi belum gw lihat terender.** Gw tidak bisa melihat gambar,
-  jadi yang gw pastikan: build lolos, `window.confirm` sudah 0, keyboard
-  handler + cleanup terpasang. Tampilannya perlu lu nilai sendiri.
-- Alur mint sukses end-to-end dengan kode baru (dulu jalur ini yang salah lapor).
+- **Paralel dengan DB sungguhan.** Yang teruji: logika loop (simulasi), kunci
+  wallet (unit test), dan build. Fungsi Postgres `aco_claim_job` /
+  `aco_release_dead_jobs` **belum pernah dijalankan** — sintaksnya gw tulis
+  hati-hati tapi belum dieksekusi Postgres.
+- **Heartbeat di kondisi nyata** (job menunggu berjam-jam lalu tetap hidup).
+- Perilaku saat 8 slot penuh dan job ke-9 masuk.
 
-Tes berikutnya: mint sekali lagi. Yang harus lu lihat — `Mint SUKSES · N item ·
-block …`, tidak ada percobaan 2/3 yang sia-sia, dan galeri item di panel job.
-Kalau job lu yang lama masih tersimpan, panel galerinya kosong karena datanya
-belum ada saat itu.
+Tes yang paling berguna: **jadwalkan 2 slug bersamaan**, lalu lihat `pm2 logs`.
+Harus muncul dua baris `job … mulai · 2/8 slot terpakai` — bukan satu job
+menunggu yang lain. Kalau `--check` mengeluh soal `heartbeat_at`, migration-nya
+belum jalan.

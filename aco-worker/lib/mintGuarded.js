@@ -19,6 +19,7 @@ import { withRetry, classifyError, traitsOf, ErrorKind } from "./retry.js";
 import { fetchCalldataWithRetry } from "./graphql.js";
 import { confirmOnChain } from "./confirmChain.js";
 import { fetchMintedItems } from "./itemDetail.js";
+import { withWalletLock } from "./walletLock.js";
 
 /** Catat satu percobaan ke aco_attempts untuk audit. */
 async function recordAttempt(supabase, row) {
@@ -139,27 +140,37 @@ export async function mintWalletGuarded({
         const gasLimit = pf.gasLimit || job.gas_limit;
 
         // ---- 3. Kirim tx (TANPA failover) ----------------------------------
-        // Nonce diambil sedekat mungkin dengan pengiriman supaya tidak basi
-        // kalau ada retry.
-        const nonceRes = await pool.call(
-          (p) => p.getTransactionCount(address, "pending"),
-          { label: "getNonce" }
-        );
-        const feeRes = await pool.call((p) => p.getFeeData(), { label: "getFeeData" });
+        //
+        // Ambil-nonce sampai kirim-tx DIKUNCI PER WALLET.
+        //
+        // Kenapa: sejak job jalan paralel, dua job bisa memakai wallet yang
+        // sama (user menjadwalkan 2 slug dengan wallet itu, windownya
+        // bertabrakan). Tanpa kunci, keduanya membaca nonce "pending" yang SAMA,
+        // lalu tx kedua MENIMPA tx pertama di mempool — satu mint hilang tanpa
+        // jejak, gas tetap terbakar.
+        //
+        // Wallet berbeda tidak saling menunggu, jadi mint paralel multi-wallet
+        // tetap secepat sebelumnya.
+        const { tx, entry } = await withWalletLock(address, async () => {
+          // Nonce diambil sedekat mungkin dengan pengiriman supaya tidak basi.
+          const nonceRes = await pool.call(
+            (p) => p.getTransactionCount(address, "pending"),
+            { label: "getNonce" }
+          );
+          const feeRes = await pool.call((p) => p.getFeeData(), { label: "getFeeData" });
 
-        const txRequest = {
-          to: calldata.to,
-          data: calldata.data,
-          value: BigInt(calldata.value || "0"),
-          nonce: nonceRes.result,
-          gasLimit,
-          maxFeePerGas: feeRes.result.maxFeePerGas,
-          maxPriorityFeePerGas: feeRes.result.maxPriorityFeePerGas,
-          chainId: job.chain_id,
-        };
+          const txRequest = {
+            to: calldata.to,
+            data: calldata.data,
+            value: BigInt(calldata.value || "0"),
+            nonce: nonceRes.result,
+            gasLimit,
+            maxFeePerGas: feeRes.result.maxFeePerGas,
+            maxPriorityFeePerGas: feeRes.result.maxPriorityFeePerGas,
+            chainId: job.chain_id,
+          };
 
-        const { tx, entry } = await pool.sendOnce(signerFor, txRequest, {
-          label: "sendMintTx",
+          return pool.sendOnce(signerFor, txRequest, { label: "sendMintTx" });
         });
 
         sentTxHash = tx.hash;

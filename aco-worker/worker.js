@@ -10,6 +10,7 @@ import { RpcPool } from "./lib/rpcPool.js";
 import { statsSnapshot } from "./lib/rateLimiter.js";
 import { mintWalletGuarded } from "./lib/mintGuarded.js";
 import { drainEligibilityQueue } from "./lib/eligWorker.js";
+import { withWalletLock } from "./lib/walletLock.js";
 import { getSiweSession } from "./lib/siweSession.js";
 import { fetchDropInfo } from "./lib/graphql.js";
 
@@ -38,6 +39,18 @@ const CONFIG = {
   // Alasannya user menunggu di depan layar: kalau ikut polling 5 detik, hasil
   // yang komputasinya cuma ~1 detik jadi terasa 6 detik.
   ELIG_POLL_MS: parseInt(process.env.ELIG_POLL_MS) || 700,
+  // Berapa job mint yang boleh jalan BERSAMAAN.
+  //
+  // Dulu job diproses satu per satu. Karena processJob menunggu window mint
+  // (bisa berjam-jam), job lain tertahan di QUEUED sampai kelewat — job dengan
+  // jadwal lebih awal bisa kalah dari job yang diambil lebih dulu.
+  //
+  // 8 dipilih karena beban tiap job kecil saat menunggu (cek pembatalan tiap
+  // beberapa detik). Yang benar-benar padat cuma detik-detik mint, dan itu
+  // sudah dijaga rate limiter per-host.
+  MAX_CONCURRENT_JOBS: parseInt(process.env.MAX_CONCURRENT_JOBS) || 8,
+  // Seberapa sering job hidup memperbarui penanda hidupnya.
+  HEARTBEAT_MS: parseInt(process.env.HEARTBEAT_MS) || 30000,
   WORKER_ID: process.env.WORKER_ID || `worker-${process.pid}`,
 };
 
@@ -46,7 +59,7 @@ const CONFIG = {
 // masih OPEN mint tetap bisa dieksekusi. Sekarang yang menentukan adalah waktu
 // TUTUP stage. Kalau env MAX_LATE_MS masih ada di .env, diabaikan saja.
 
-const WORKER_VERSION = "v5";
+const WORKER_VERSION = "v6";
 
 // SIWE login memakan ~2 detik per wallet. Untuk mint yang menang-kalahnya
 // hitungan detik, itu mahal. Session dipanaskan lebih awal: dimulai
@@ -88,11 +101,44 @@ async function isCancelled(jobId) {
  * ini tidak mengenai baris apa pun dan `data` jadi null.
  */
 async function claimNextJob() {
+  // Klaim lewat fungsi Postgres: satu pernyataan, `for update skip locked`,
+  // dan URUTAN BERDASARKAN JADWAL (stage_start_time) — bukan urutan pembuatan.
+  //
+  // Ini inti perbaikannya: job yang mau mint 10 menit lagi harus menang dari
+  // job yang mau mint 6 jam lagi, walau dibuat belakangan.
+  const { data, error } = await supabase.rpc("aco_claim_job", {
+    p_worker: CONFIG.WORKER_ID,
+  });
+
+  if (error) {
+    // Fungsi belum ada = migration_aco_parallel.sql belum dijalankan.
+    // Jatuh ke cara lama supaya worker tetap bisa jalan, tapi beri tahu.
+    if (String(error.message).includes("aco_claim_job")) {
+      if (!claimFallbackWarned) {
+        claimFallbackWarned = true;
+        console.warn(
+          "  [worker] fungsi aco_claim_job belum ada — pakai klaim lama " +
+            "(job tetap SEQUENTIAL). Jalankan supabase/migration_aco_parallel.sql."
+        );
+      }
+      return claimNextJobLegacy();
+    }
+    console.error(`  [worker] gagal klaim: ${error.message}`);
+    return null;
+  }
+
+  return Array.isArray(data) ? (data[0] ?? null) : (data ?? null);
+}
+
+let claimFallbackWarned = false;
+
+/** Cara lama — dipakai hanya kalau migration paralel belum dijalankan. */
+async function claimNextJobLegacy() {
   const { data: candidates, error } = await supabase
     .from("aco_jobs")
     .select("*")
     .eq("status", "QUEUED")
-    .order("created_at", { ascending: true })
+    .order("stage_start_time", { ascending: true })
     .limit(5);
 
   if (error) {
@@ -108,6 +154,7 @@ async function claimNextJob() {
         status: "CLAIMED",
         claimed_by: CONFIG.WORKER_ID,
         claimed_at: new Date().toISOString(),
+        heartbeat_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       })
       .eq("id", candidate.id)
@@ -121,25 +168,65 @@ async function claimNextJob() {
   return null;
 }
 
-/** Bebaskan job yang nyangkut karena worker mati di tengah jalan. */
+/**
+ * Bebaskan job yang benar-benar MATI (worker crash/restart).
+ *
+ * BUG YANG DIPERBAIKI: versi lama menggagalkan semua job CLAIMED/RUNNING yang
+ * `claimed_at`-nya lebih tua dari 30 menit. Job yang SAH sedang menunggu window
+ * 6 jam ke depan ikut dibunuh dan ditandai "nyangkut" — artinya menjadwalkan
+ * mint lebih dari 30 menit di depan tidak pernah bisa berhasil.
+ *
+ * Sekarang yang dipakai adalah heartbeat: job hidup memperbarui `heartbeat_at`
+ * tiap ~30 detik, jadi hanya job tanpa kabar 3 menit yang dianggap mati.
+ */
 async function releaseStuckJobs() {
-  const cutoff = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+  const { data, error } = await supabase.rpc("aco_release_dead_jobs", {
+    p_stale_seconds: 180,
+  });
 
-  const { data } = await supabase
-    .from("aco_jobs")
-    .update({
-      status: "FAILED",
-      error_message: "Worker berhenti di tengah jalan (job nyangkut > 30 menit)",
-      finished_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    })
-    .in("status", ["CLAIMED", "RUNNING"])
-    .lt("claimed_at", cutoff)
-    .select("id");
-
-  if (data?.length) {
-    console.log(`  [worker] ${data.length} job nyangkut dibebaskan`);
+  if (error) {
+    // Migration paralel belum dijalankan. JANGAN jatuh ke cara lama —
+    // cara lama justru membunuh job yang sedang menunggu. Lebih aman tidak
+    // membersihkan apa pun sampai migration dijalankan.
+    if (!releaseFallbackWarned) {
+      releaseFallbackWarned = true;
+      console.warn(
+        "  [worker] fungsi aco_release_dead_jobs belum ada — pembersihan job " +
+          "mati DILEWATI. Jalankan supabase/migration_aco_parallel.sql."
+      );
+    }
+    return;
   }
+
+  if (data > 0) {
+    console.log(`  [worker] ${data} job mati dibebaskan (heartbeat hilang)`);
+  }
+}
+
+let releaseFallbackWarned = false;
+
+/**
+ * Heartbeat: tandai job masih hidup.
+ *
+ * Dipanggil berkala selama job diproses — terutama saat menunggu window, karena
+ * di situlah job bisa "diam" berjam-jam tanpa aktivitas apa pun.
+ */
+function startHeartbeat(jobId) {
+  const timer = setInterval(async () => {
+    try {
+      await supabase
+        .from("aco_jobs")
+        .update({ heartbeat_at: new Date().toISOString() })
+        .eq("id", jobId);
+    } catch {
+      /* kegagalan heartbeat tidak boleh menggagalkan job */
+    }
+  }, CONFIG.HEARTBEAT_MS);
+
+  // unref: timer tidak boleh menahan proses keluar saat SIGTERM.
+  timer.unref?.();
+
+  return () => clearInterval(timer);
 }
 
 /* -------------------------------------------------------------- login batch */
@@ -273,6 +360,10 @@ async function waitForWindow(startTimeISO, jobId, log, onPreheat = null) {
 
 async function processJob(job) {
   const log = createJobLogger(job.id);
+
+  // Heartbeat dimulai SEBELUM apa pun. Job yang menunggu window berjam-jam
+  // harus tetap dianggap hidup, kalau tidak ia akan dibunuh sebagai "job mati".
+  const stopHeartbeat = startHeartbeat(job.id);
 
   console.log("");
   console.log(`  ── job ${job.id.slice(0, 8)} · ${job.slug} · ${ts()} ──`);
@@ -671,8 +762,13 @@ async function processJob(job) {
       finished_at: new Date().toISOString(),
     });
   } finally {
+    // Heartbeat dihentikan lebih dulu — kalau tidak, timer tetap jalan setelah
+    // job selesai dan terus menulis ke DB untuk job yang sudah DONE.
+    stopHeartbeat();
+
     // RpcPool memegang provider (WebSocket bisa menahan socket); wajib ditutup
     // atau proses menumpuk koneksi tiap job dan kehabisan file descriptor.
+    // Dengan job paralel ini makin penting: tiap job punya pool sendiri.
     try {
       await pool?.destroy?.();
     } catch {
@@ -771,6 +867,27 @@ async function main() {
     console.log("  ✓ Eligibility checker siap");
   }
 
+  // Cek kesiapan job paralel. Kalau belum siap, job masih jalan tapi SEQUENTIAL
+  // dan pembersihan job mati dilewati — itu perlu diberitahu dengan jelas.
+  //
+  // PENTING: jangan memeriksa dengan MEMANGGIL aco_claim_job — fungsi itu
+  // benar-benar mengklaim job yang mengantre, jadi `--check` bisa mencuri job
+  // milik worker yang sedang jalan dan membiarkannya CLAIMED oleh probe.
+  // Yang diperiksa: kolom `heartbeat_at`, yang dibuat oleh migration yang sama.
+  const { error: claimFnError } = await supabase
+    .from("aco_jobs")
+    .select("heartbeat_at")
+    .limit(1);
+
+  if (claimFnError) {
+    console.log("");
+    console.log("  ⚠ Kolom heartbeat_at belum ada — job masih SEQUENTIAL dan");
+    console.log("    pembersihan job mati DILEWATI (demi keamanan).");
+    console.log("    Jalankan supabase/migration_aco_parallel.sql.");
+  } else {
+    console.log(`  ✓ Job paralel siap (maks ${CONFIG.MAX_CONCURRENT_JOBS} bersamaan)`);
+  }
+
   if (checkOnly) {
     console.log("");
     console.log("  Semua pemeriksaan lolos. Worker siap dijalankan.");
@@ -779,30 +896,67 @@ async function main() {
   }
 
   console.log(`  worker id : ${CONFIG.WORKER_ID}`);
-  console.log(`  polling   : tiap ${CONFIG.POLL_INTERVAL_MS / 1000}s`);
+  console.log(`  paralel   : maks ${CONFIG.MAX_CONCURRENT_JOBS} job bersamaan`);
+  console.log(`  heartbeat : tiap ${CONFIG.HEARTBEAT_MS / 1000}s`);
   console.log("");
 
   await releaseStuckJobs();
 
   let idleTicks = 0;
 
-  // Loop utama. Job diproses satu per satu (sequential) — mint butuh CPU dan
-  // jaringan penuh, menjalankan dua job berbarengan justru saling melambatkan.
+  // Job yang sedang diproses. Kuncinya: processJob TIDAK di-await di loop —
+  // ia jalan di latar, jadi loop bisa langsung mengambil job berikutnya.
+  const running = new Map(); // jobId -> Promise
+
+  const startJob = (job) => {
+    const p = processJob(job)
+      .catch((err) => {
+        // processJob sudah menangani errornya sendiri; ini jaring terakhir
+        // supaya satu job gagal tidak menjatuhkan seluruh worker.
+        console.error(`  [worker] job ${job.id.slice(0, 8)} lolos ke luar: ${err?.message ?? err}`);
+      })
+      .finally(() => running.delete(job.id));
+
+    running.set(job.id, p);
+  };
+
+  // Loop utama. Job mint jalan BERSAMAAN (sampai MAX_CONCURRENT_JOBS).
+  //
+  // Dulu sequential: satu job diproses sampai tuntas sebelum job berikutnya
+  // diambil. Karena processJob menunggu window mint (bisa berjam-jam), job lain
+  // tertahan di QUEUED sampai jadwalnya kelewat — beberapa user tidak bisa
+  // pakai ACO bersamaan, dan satu user tidak bisa menjadwalkan 2 slug.
+  //
+  // Menjalankan bersamaan aman karena beban tiap job hampir nol saat menunggu;
+  // yang padat cuma detik-detik mint, dan itu dijaga rate limiter per-host.
   while (true) {
     try {
       // Eligibility check DIDAHULUKAN: user sedang menunggu di depan layar dan
-      // pengecekannya cepat (~2-4s), sementara job mint biasanya masih
-      // menunggu jadwal. Kalau job mint didahulukan, pengecekan bisa tertahan
-      // berjam-jam di belakang job yang sedang menunggu window.
+      // pengecekannya cepat (~1-2s), sementara job mint biasanya masih
+      // menunggu jadwal.
       const checked = await drainEligibilityQueue({
         workerId: CONFIG.WORKER_ID,
       });
 
-      const job = await claimNextJob();
+      // Ambil job sebanyak slot yang tersisa, tidak cuma satu — kalau 3 job
+      // masuk sekaligus, ketiganya harus langsung jalan.
+      let claimedNow = 0;
+      while (running.size < CONFIG.MAX_CONCURRENT_JOBS) {
+        const job = await claimNextJob();
+        if (!job) break;
 
-      if (job) {
+        startJob(job);
+        claimedNow++;
+        console.log(
+          `  [${ts()}] job ${job.id.slice(0, 8)} (${job.slug}) mulai · ` +
+            `${running.size}/${CONFIG.MAX_CONCURRENT_JOBS} slot terpakai`
+        );
+      }
+
+      if (claimedNow > 0) {
         idleTicks = 0;
-        await processJob(job);
+        // Jangan tidur penuh: mungkin masih ada job lain yang mengantre.
+        await sleep(200);
       } else if (checked > 0) {
         // Baru saja memproses check — jangan tidur penuh, mungkin ada
         // pengecekan lain yang menyusul.
@@ -812,7 +966,10 @@ async function main() {
         idleTicks++;
         // Heartbeat tiap ~5 menit biar kelihatan worker masih hidup di pm2 logs
         if (idleTicks % Math.max(1, Math.floor(300000 / CONFIG.ELIG_POLL_MS)) === 0) {
-          console.log(`  [${ts()}] idle, menunggu job…`);
+          console.log(
+            `  [${ts()}] idle · ${running.size} job jalan` +
+              (running.size > 0 ? " (menunggu window)" : "")
+          );
           await releaseStuckJobs();
           // Bersihkan hasil check basi + session SIWE kedaluwarsa. Hasil check
           // lama tidak berguna (allowlist bisa berubah) dan cuma menumpuk.

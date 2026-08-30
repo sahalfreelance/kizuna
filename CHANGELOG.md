@@ -6,208 +6,205 @@ Ringkas per tahap: apa yang berubah, dan kenapa.
 
 ## 1. Login username + password
 
-Discord OAuth dibuang total (9 file, `next-auth` dicabut). Password **scrypt**,
-sesi **token HMAC stateless**, **1 user 1 device** via UNIQUE partial index
-Postgres. Naikkan `session_version` = semua token lama mati seketika.
+Discord OAuth dibuang (9 file, `next-auth` dicabut). Password scrypt, sesi token
+HMAC stateless, 1 user 1 device via UNIQUE partial index.
 
-**Masalah yang ketemu:** `node:crypto` tidak ada di Edge runtime dan
-`middleware.js` jalan di Edge — akan gagal setelah deploy dan semua orang tidak
-bisa login. Dibuat `lib/sessionEdge.js` pakai Web Crypto. Timing attack di login
-ditutup dengan padding 120ms. Race condition bind device ditutup dengan guard
-`.is("device_id", null)`.
-
-**Beda dari permintaan:** diminta `/register` pakai argumen slash command — tidak
-dilakukan, argumen itu tampil ke seisi channel. Diganti popup form.
+**Ketemu:** `node:crypto` tidak ada di Edge runtime (middleware jalan di Edge) —
+akan gagal setelah deploy, semua orang tidak bisa login. Dibuat `sessionEdge.js`
+pakai Web Crypto. Timing attack ditutup padding 120ms. Race condition bind device
+ditutup guard `.is("device_id", null)`.
 
 ---
 
 ## 2. ACO — arsitektur
 
-Website = panel kontrol, worker VPS = eksekutor. Vercel function maks 300s dan
-cron Hobby 1×/hari ±59 menit — tidak mungkin mengejar mint jam 14:30:00.
+Website = panel kontrol, worker VPS = eksekutor. Vercel function maks 300s, cron
+Hobby 1×/hari ±59 menit — tidak mungkin mengejar mint jam 14:30:00.
 
-`auth.js`, `graphql.js`, `mint.js` dari script CLI dipakai apa adanya. Private
-key AES-256-GCM, kunci di env, write-only.
-
-**Masalah yang ketemu:** `auth.js` `throw` di top-level; `ethers` belum ada di
-`package.json`; `WebSocketProvider` kebocoran socket (CLI `process.exit()` jadi
-tidak terasa, worker hidup terus jadi menumpuk).
+**Ketemu:** `auth.js` throw di top-level; `ethers` belum ada di package.json;
+`WebSocketProvider` kebocoran socket.
 
 ---
 
 ## 3. Multi-chain + custom RPC
 
-Chain dideteksi otomatis dari OpenSea, tidak dipilih user.
-
-**Masalah yang ketemu:** SSRF — RPC URL diinput user lalu dihubungi server, bisa
-dipakai memindai jaringan internal VPS. Chain id RPC tidak diverifikasi — RPC
-Ethereum untuk job Base = tx ke jaringan salah. RPC Ronin default 403, diganti
-`ronin.drpc.org`.
+**Ketemu:** SSRF (RPC URL user dihubungi server, bisa memindai jaringan internal
+VPS). Chain id RPC tidak diverifikasi. RPC Ronin default 403.
 
 ---
 
 ## 4. API key OpenSea per user
 
-Endpoint diuji: `429 Maximum 2 keys per day` — **per IP**. Kalau server yang
-minta, kuota habis setelah 2 user. Solusi: diminta dari **browser user** (CORS
-diverifikasi mengizinkan). Umur dicek tiap login, diganti di hari ke-21 dari 30.
+`429 Maximum 2 keys per day` — **per IP**. Diminta dari browser user. Umur dicek
+tiap login, diganti hari ke-21 dari 30.
 
 ---
 
 ## 5. Anti-revert, auto-retry, anti rate-limit
 
-**Anti-revert** — stage buka (0ms) → saldo → `eth_call` → `estimateGas`. Kalau
-RPC bermasalah, simulasi dilewati dan tx tetap dikirim.
+Preflight: stage buka → saldo → `eth_call` → `estimateGas`. RPC bermasalah →
+simulasi dilewati, tx tetap dikirim.
 
-**Auto-retry** — `RATE_LIMIT`/`RPC_DOWN` diulang + pindah RPC.
-`NOT_ELIGIBLE`/`SOLD_OUT`/`INSUFFICIENT_FUNDS`/`WOULD_REVERT` stop.
-`TX_SENT_UNKNOWN` tidak pernah diulang.
+Retry: `RATE_LIMIT`/`RPC_DOWN` diulang + pindah RPC. `TX_SENT_UNKNOWN` tidak
+pernah diulang.
 
-**Anti rate-limit** — token bucket per host, `Retry-After` dihormati.
-
-**Bug yang ketemu:** `"wallet not eligible for this stage"` salah diklasifikasi
-`NOT_LIVE` karena mengandung "stage" dan "not". Urutan diperbaiki.
+**Ketemu:** `"wallet not eligible for this stage"` salah diklasifikasi `NOT_LIVE`.
 
 ---
 
 ## 6. Mintbay ditambahkan
 
-Sebelumnya cuma Scatter — salah tangkap. Jadi 4 tab. Deskripsi "yang masih perlu
-dibangun" dipindah ke field `pendingWork` di registry.
+Sebelumnya cuma Scatter — salah tangkap. Jadi 4 tab.
 
 ---
 
 ## 7. Robinhood Chain + batas 2 wallet
 
-Dikonfirmasi dari `GET api.opensea.io/api/v2/chains`. chainId 4663, RPC diuji
-103ms. `MAX_WALLETS_PER_USER` 20 → 2, ditegakkan di server.
+chainId 4663, dikonfirmasi dari API OpenSea. `MAX_WALLETS_PER_USER` 20 → 2.
 
 ---
 
 ## 8. Eligibility checker + fix login SIWE
 
-**Bug login.** `headers.raw()` cuma ada di node-fetch; setelah diganti undici,
-kode jatuh ke `headers.get("set-cookie")` yang menggabungkan semua Set-Cookie
-jadi satu string — parser cuma ambil pasangan pertama (`__cf_bm`), jadi
-`access_token` tidak pernah terbaca. Diperbaiki pakai `getSetCookie()`.
+**Bug login:** `headers.raw()` cuma ada di node-fetch; setelah diganti undici,
+`headers.get("set-cookie")` menggabungkan semua Set-Cookie jadi satu string dan
+parser cuma ambil yang pertama — `access_token` tidak pernah terbaca. Diperbaiki
+pakai `getSetCookie()`.
 
-**Checker.** Diadaptasi dari `pdonir/nft-mint-check-pipeline`. Field eligibility
-dikunci di balik auth (tanpa auth → `UNAUTHORIZED @ stages.isEligible`), jadi
-harus SIWE login — hanya bisa di worker. Label `ELIGIBLE 2/2` + rincian per
-wallet. `unknown` dibedakan dari `not eligible`.
+**Checker:** field eligibility dikunci di balik auth, jadi harus SIWE login —
+hanya bisa di worker. Label `ELIGIBLE 2/2` + rincian per wallet. `unknown`
+dibedakan dari `not eligible`.
 
 ---
 
 ## 9. Job jalan selama stage masih buka + checker dipercepat
 
-**Logika window.** Job digagalkan kalau waktu **buka** lewat > 5 menit — salah,
-karena selama stage masih OPEN mint masih bisa. Yang menentukan sekarang waktu
-**TUTUP**. `MAX_LATE_MS` dihapus. Diuji 6 kasus, 6/6 benar.
+Job digagalkan kalau waktu **buka** lewat > 5 menit — salah, selama stage masih
+OPEN mint masih bisa. Yang menentukan sekarang waktu **TUTUP**.
 
-**Checker dipercepat** ~7s → ~1-2s: login paralel, query paralel, worker polling
-5000→700ms, browser polling 1000→400ms, cache session 20 menit.
-
-**Session dipakai bersama** checker ↔ mint, plus pemanasan 90 detik sebelum
-window buka.
+Checker ~7s → ~1-2s: login paralel, query paralel, polling worker 5000→700ms,
+browser 1000→400ms, cache session 20 menit. Session dipakai bersama checker ↔
+mint + pemanasan 90 detik sebelum window.
 
 ---
 
 ## 10. Konfirmasi on-chain + galeri item + dialog bertema
 
-### Status mint dibaca dari chain
+Log user melaporkan `0/1 berhasil` padahal tx-nya **status 1 SUKSES, 2 token
+masuk** (dibaca langsung dari Robinhood Chain, block 49464109). Yang gagal cuma
+pembacaan status dari OpenSea karena 429.
 
-Log user:
+`waitForMintStatus()` (OpenSea) → `confirmOnChain()` (receipt). OpenSea sekarang
+cuma untuk nama & gambar, setelah status pasti.
 
+**Ketemu:** contract address OpenSea (`0x5cae…328e`) berbeda dari kontrak yang
+me-mint (`0x4997…5390`) — normal di SeaDrop. Filter ketat = 0 token padahal 2
+masuk, jadi filter dijadikan preferensi dengan fallback.
+
+Galeri item + dialog konfirmasi bertema (`window.confirm` memblokir thread JS,
+jadi log realtime berhenti selama dialog terbuka).
+
+---
+
+## 11. Job paralel + heartbeat + kunci nonce
+
+User bertanya apakah ACO mengantre saat dipakai beberapa user atau saat satu user
+menjadwalkan lebih dari 1 slug. Jawabannya iya, dan ada 3 masalah.
+
+### Masalah A: antrean
+
+```js
+const job = await claimNextJob();
+if (job) await processJob(job);   // memblokir sampai selesai
 ```
-OK    Tx dikirim: 0x4e43…1d5e
-WARN  Percobaan 1 gagal (RATE_LIMIT): 429 (gql.opensea.io)
-OK    Selesai — 0/1 wallet berhasil mint
+
+`processJob` menunggu window mint (bisa berjam-jam), jadi job lain tertahan di
+QUEUED sampai kelewat.
+
+Perbaikan: `processJob` tidak di-`await` — dijalankan di latar dan dilacak di
+`Map`, dengan batas `MAX_CONCURRENT_JOBS` (default 8). Loop mengambil job
+sebanyak slot tersisa, bukan satu per tick.
+
+Aman paralel karena beban job saat menunggu hampir nol; yang padat cuma
+detik-detik mint, dan itu dijaga rate limiter per-host.
+
+**Urutan pengambilan juga salah.** Dulu `created_at` — job yang dibuat lebih dulu
+menang walau jadwalnya jauh. Sekarang `stage_start_time`.
+
+Klaim dipindah ke fungsi Postgres `aco_claim_job` dengan `for update skip
+locked`: satu pernyataan, tidak bisa bertabrakan, pemanggil paralel melewati
+baris yang sedang dikunci. Ada fallback ke cara lama kalau migration belum
+dijalankan (dengan peringatan sekali).
+
+### Masalah B: job dibunuh saat menunggu
+
+```js
+// CLAIMED/RUNNING lebih tua dari 30 menit → FAILED "job nyangkut"
 ```
 
-Dibaca langsung dari Robinhood Chain: **status 1 SUKSES, block 49464109, 2 token
-masuk (#600, #601)**. Mint berhasil; yang gagal cuma pembacaan status dari
-OpenSea karena rate limit.
+Job yang sah sedang menunggu window 6 jam ke depan ikut dibunuh. Artinya
+menjadwalkan mint > 30 menit di depan **tidak pernah bisa berhasil**, terlepas
+dari masalah antrean.
 
-`waitForMintStatus()` (OpenSea) diganti `confirmOnChain()` (receipt). Receipt
-tidak bisa kena rate limit OpenSea, tidak butuh cookie, hasilnya pasti. Token
-dihitung dari event `Transfer`/`TransferSingle`/`TransferBatch` dari address nol
-ke wallet — itu definisi mint, jadi transfer biasa tidak salah dihitung.
+Perbaikan: kolom `heartbeat_at` + `startHeartbeat()` yang memperbarui tiap 30
+detik selama job diproses. `aco_release_dead_jobs` hanya membunuh job tanpa kabar
+3 menit.
 
-OpenSea sekarang cuma untuk melengkapi nama & gambar, **setelah** status pasti.
-Kegagalannya tidak lagi bisa mengubah status.
+Kalau migration belum ada, pembersihan **dilewati sepenuhnya** — bukan jatuh ke
+cara lama, karena cara lama justru merusak. Timer di-`unref()` supaya tidak
+menahan proses keluar saat SIGTERM, dan dihentikan di blok `finally`.
 
-### Contract address OpenSea bisa berbeda
+### Masalah C: dua job, satu wallet
 
-Temuan dari tx sungguhan: OpenSea memberi `0x5cae…328e`, tapi NFT di-mint dari
-`0x4997…5390`. Normal di SeaDrop — alamat yang dipanggil dan kontrak NFT bisa
-beda.
+Sejak paralel, dua job bisa memakai wallet sama (user menjadwalkan 2 slug,
+windownya bertabrakan). Keduanya membaca nonce "pending" yang sama, tx kedua
+**menimpa** tx pertama — satu mint hilang, gas terbakar.
 
-Filter ketat menghasilkan **0 token** padahal 2 token masuk. Jadi filter dipakai
-sebagai preferensi: cocok diutamakan, kalau tidak ada yang cocok semua mint ke
-wallet ini diterima.
+`lib/walletLock.js`: mutex in-process per address, membungkus ambil-nonce →
+kirim-tx. Wallet berbeda tidak saling menunggu.
 
-### Retry sia-sia
+**Bug yang ketemu saat menguji:** kunci bocor — 52 entri tersisa setelah 50
+operasi. Penyebabnya `locks.get(key) === prev.then(() => current)` di blok
+`finally`; `.then()` membuat promise BARU tiap dipanggil, jadi perbandingannya
+selalu false dan entri tidak pernah dihapus. Referensinya sekarang disimpan di
+variabel.
 
-Percobaan 2 & 3 langsung menabrak guard `sentTxHash` — 2 WARN tidak berguna,
-~1,7 detik terbuang. Penyebabnya `alreadySent` diklasifikasi `UNKNOWN`
-(retryable). Sekarang dikenali langsung sebagai `TX_SENT_UNKNOWN` di `withRetry`
-dan berhenti seketika.
+### Probe `--check` yang hampir merusak
 
-### Galeri item
-
-`components/MintedItems.js` — grid kartu NFT dengan gambar, token id, standard,
-link OpenSea, badge quantity untuk ERC-1155.
-
-Gambar NFT sering di IPFS dan bisa lambat/gagal, jadi tiap kartu punya fallback:
-token id tampil besar, link tetap bisa diklik. Token baru mint biasanya belum
-terindeks OpenSea — ditandai "belum terindeks", bukan error.
-
-`lib/itemDetail.js` mencoba `api.opensea.io/v2` dulu, lalu `gql.opensea.io`, lalu
-fallback minimal. **Selalu** mengembalikan entri selengkap input — token yang
-gagal diambil tetap punya token id dan link.
-
-Baris hasil per wallet ditambah `N item`, `blk`, `gas`. Daftar URL explorer yang
-tadinya hardcode di UI diganti `explorerTxUrl()` dari `lib/chains.js`.
-
-### Dialog konfirmasi
-
-`window.confirm()` dirender browser/OS — tidak bisa diberi tema, dan
-**memblokir thread JS** sehingga log realtime berhenti diperbarui selama dialog
-terbuka.
-
-`components/ConfirmDialog.js` + hook `useConfirm()`: tema gelap, bar judul gaya
-panel terminal, dot warna (merah untuk destruktif), animasi masuk. Enter =
-lanjut, Esc = batal, klik luar = batal, `body.overflow` dikembalikan saat unmount.
-
-Pesan diperjelas — hapus wallet menyebut private key hilang permanen; batalkan
-job saat `CLAIMED` menyebut tx yang sudah terkirim tidak bisa ditarik.
-
-3 tempat diganti: hapus wallet, hapus RPC custom, batalkan job.
+Versi pertama memeriksa kesiapan paralel dengan **memanggil `aco_claim_job`** —
+fungsi itu benar-benar mengklaim job. Artinya `node worker.js --check` bisa
+mencuri job milik worker yang sedang jalan dan membiarkannya `CLAIMED` oleh
+`__probe__`. Diganti: memeriksa keberadaan kolom `heartbeat_at`.
 
 ---
 
 ## Hasil tes kumulatif
 
 ```
+simulasi loop paralel vs sequential
+  sequential 2/3 job KELEWAT · paralel 0/3 ✓
+  paralel 1.5x lebih cepat ✓
+
+kunci per wallet          5 kasus ✓
+  wallet sama berurutan, tanpa overlap ✓
+  wallet beda paralel (120ms vs 240ms) ✓
+  error tidak deadlock ✓  return value ✓
+  50 operasi → 0 entri (tidak bocor) ✓
+
 tx SUNGGUHAN user (Robinhood, block 49464109)
   status 1 SUKSES, gasUsed 128836, 2 token ✓
-  worker LAMA 0/1 vs chain SUKSES ✓
-
 extractMintedTokens       9 kasus ✓
-  ERC721/1155 Single/Batch ✓  transfer biasa diabaikan ✓
-  wallet lain diabaikan ✓  log rusak tidak crash ✓
-  kontrak cocok diutamakan, fallback kalau tidak ada ✓
 fetchMintedItems          selalu balikan entri lengkap ✓
 explorerTxUrl             7 chain ✓
 logika window             6/6 ✓
 SIWE login                access_token JWT valid ✓
 decideEligible            9/9 ✓
-summarizeStages           1/2 & 2/2 ✓  wallet gagal tidak dihitung ✓
+summarizeStages           1/2 & 2/2 ✓
 enkripsi                  roundtrip ✓ tamper ditolak ✓ web↔worker ✓
 klasifikasi error         12/12 ✓
 rate limiter              burst, Retry-After, host terpisah ✓
 RPC pool (mainnet)        failover ✓ chain salah ditolak ✓
-anti-revert (mainnet)     revert reason "require(false)" didecode ✓
+anti-revert (mainnet)     revert reason didecode ✓
 chain                     13/13 RPC ✓ 13/13 identifier ✓
 endpoint tanpa auth       7/7 → 401 ✓
 window.confirm tersisa    0 ✓
@@ -216,10 +213,12 @@ build                     ✓ Compiled successfully
 
 ### Yang tidak bisa diuji dari sini
 
-- **Gambar NFT tampil sungguhan.** `api.opensea.io/v2` menolak tanpa API key
-  (401) dari VPS ini, dan token user belum terindeks. Jalur fallback teruji;
-  jalur gambar akan terbukti di produksi.
-- **Tampilan dialog konfirmasi.** Build lolos dan `window.confirm` sudah 0, tapi
-  hasil rendernya belum dilihat.
+- **Fungsi Postgres belum pernah dieksekusi.** `aco_claim_job` dan
+  `aco_release_dead_jobs` ditulis hati-hati tapi belum dijalankan Postgres.
+- **Paralel dengan DB sungguhan** dan **heartbeat di kondisi nyata** (job
+  menunggu berjam-jam lalu tetap hidup).
+- **Gambar NFT tampil sungguhan** — `api.opensea.io/v2` menolak tanpa API key
+  dari VPS ini.
+- **Tampilan dialog konfirmasi** — build lolos, `window.confirm` 0, tapi hasil
+  rendernya belum dilihat.
 - **Nilai `isEligible` sungguhan** — semua koleksi yang dicoba `drop`-nya `null`.
-- Alur mint sukses end-to-end dengan kode baru.
