@@ -127,9 +127,8 @@ function OpenseaKeyPanel() {
       {status === null ? (
         <p style={{ fontSize: 11, color: "var(--text-dim)" }}>memuat…</p>
       ) : !status.present ? (
-        <p style={{ fontSize: 11, color: "var(--live)", lineHeight: 1.7 }}>
-          Belum ada API key. Tekan <strong>refresh</strong> untuk membuatnya —
-          key diminta dari browser kamu, jadi tidak berebut kuota dengan user lain.
+        <p style={{ fontSize: 11, color: "var(--live)" }}>
+          Belum ada API key — tekan refresh.
         </p>
       ) : (
         <div style={{ fontSize: 11, color: "var(--text-dim)", lineHeight: 1.9 }}>
@@ -165,16 +164,11 @@ function OpenseaKeyPanel() {
           }}
         >
           {msg.action === "rate_limited"
-            ? "Kuota pembuatan key OpenSea habis (2 per hari dari IP kamu). Coba lagi besok — key lama tetap dipakai kalau masih berlaku."
+            ? "Kuota key habis (2/hari per IP). Coba lagi besok."
             : msg.reason}
         </div>
       )}
 
-      <p style={{ fontSize: 9.5, color: "var(--text-dim)", lineHeight: 1.65, marginTop: 10, paddingTop: 9, borderTop: "1px solid var(--border)" }}>
-        Tiap user punya API key sendiri supaya rate limit tidak bentrok saat
-        beberapa orang mint bersamaan. Key diperiksa otomatis tiap kamu login
-        dan diperbarui kalau sudah tua. Berlaku 30 hari.
-      </p>
     </div>
   );
 }
@@ -217,7 +211,6 @@ function RpcManager({ chains, onChange, ask }) {
     const yes = await ask({
       title: "Hapus RPC custom",
       message: `Hapus RPC custom untuk ${chain}?`,
-      detail: "Chain ini akan kembali memakai RPC publik yang rate-limitnya lebih ketat.",
       confirmLabel: "hapus",
     });
     if (!yes) return;
@@ -238,12 +231,6 @@ function RpcManager({ chains, onChange, ask }) {
           </span>
         </h2>
       </div>
-
-      <p style={{ fontSize: 10.5, color: "var(--text-dim)", lineHeight: 1.7, marginBottom: 12 }}>
-        Chain tanpa RPC custom pakai RPC publik gratis — rate-limit ketat, bisa
-        kalah cepat saat mint rame. Isi RPC sendiri (Alchemy/Infura/QuickNode)
-        untuk chain yang sering kamu pakai.
-      </p>
 
       <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
         {chains.map((c) => (
@@ -329,11 +316,6 @@ function RpcManager({ chains, onChange, ask }) {
                     batal
                   </button>
                 </div>
-                <p style={{ fontSize: 9.5, color: "var(--text-dim)", lineHeight: 1.6 }}>
-                  RPC disimpan terenkripsi dan tidak pernah ditampilkan lagi —
-                  yang muncul cuma nama host-nya. Worker memverifikasi chain id
-                  RPC sebelum mint; kalau tidak cocok, job digagalkan.
-                </p>
               </form>
             )}
           </div>
@@ -416,9 +398,7 @@ function WalletManager({ wallets, limit, onChange, ask }) {
     const yes = await ask({
       title: "Hapus wallet",
       message: `Hapus wallet ${short(address)}?`,
-      detail:
-        "Private key-nya dihapus permanen dari database. Kalau lu belum simpan " +
-        "cadangannya di tempat lain, wallet ini tidak bisa dipulihkan dari sini.",
+      detail: "Private key dihapus permanen. Tidak bisa dipulihkan.",
       confirmLabel: "hapus permanen",
       danger: true,
     });
@@ -447,8 +427,8 @@ function WalletManager({ wallets, limit, onChange, ask }) {
       </div>
 
       {full && (
-        <p style={{ fontSize: 10.5, color: "var(--text-dim)", lineHeight: 1.7, marginBottom: 10 }}>
-          Kuota wallet penuh (maks {maxWallets}). Hapus salah satu dulu kalau mau ganti.
+        <p style={{ fontSize: 10.5, color: "var(--text-dim)", marginBottom: 10 }}>
+          Kuota penuh (maks {maxWallets}). Hapus satu dulu.
         </p>
       )}
 
@@ -469,17 +449,10 @@ function WalletManager({ wallets, limit, onChange, ask }) {
             }}
           >
             <div style={{ color: "#f87171", fontWeight: 700, marginBottom: 5 }}>
-              BACA DULU — INI SOAL UANG KAMU
+              PAKAI WALLET BURNER
             </div>
-            Private key = kepemilikan penuh atas wallet. Yang disimpan di sini
-            dienkripsi (AES-256-GCM) dan tidak pernah dikirim balik ke browser,
-            tapi <strong style={{ color: "var(--text)" }}>admin server secara
-            teknis tetap bisa mengaksesnya</strong>. Tidak ada teknologi yang
-            bisa menghilangkan fakta itu.
-            <div style={{ marginTop: 7, color: "var(--live)" }}>
-              Pakai wallet burner khusus mint. Isi ETH secukupnya untuk gas +
-              harga mint. Jangan pakai wallet utama kamu.
-            </div>
+            Key dienkripsi, tapi admin server tetap bisa mengaksesnya. Jangan
+            pakai wallet utama.
           </div>
 
           <form onSubmit={importWallet} style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 16 }}>
@@ -519,8 +492,8 @@ function WalletManager({ wallets, limit, onChange, ask }) {
       )}
 
       {wallets.length === 0 ? (
-        <p style={{ fontSize: 11.5, color: "var(--text-dim)", lineHeight: 1.7 }}>
-          Belum ada wallet. Import dulu sebelum bisa bikin job mint.
+        <p style={{ fontSize: 11.5, color: "var(--text-dim)" }}>
+          Belum ada wallet.
         </p>
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
@@ -790,10 +763,7 @@ function JobCreator({ wallets, chains, platform, onCreated }) {
       }
 
       setEligState("timeout");
-      setEligError(
-        "Worker belum merespons dalam 30 detik. Cek worker di VPS jalan atau tidak " +
-          "(pm2 logs kizuna-aco-worker)."
-      );
+      setEligError("Worker tidak merespons (30s).");
     } catch {
       setEligState("error");
       setEligError("Tidak bisa menghubungi server.");
@@ -941,8 +911,7 @@ function JobCreator({ wallets, chains, platform, onCreated }) {
             >
               <span style={{ color: "#f87171", fontWeight: 700 }}>
                 Chain "{drop.chain}" belum didukung.
-              </span>{" "}
-              Collection ini tidak bisa di-mint lewat ACO untuk sekarang.
+              </span>
             </div>
           )}
         </>
@@ -1221,13 +1190,9 @@ function JobCreator({ wallets, chains, platform, onCreated }) {
                     onChange={(e) => setAbortOnRevert(e.target.checked)}
                     style={{ marginTop: 2, accentColor: "var(--indigo)" }}
                   />
-                  <span style={{ fontSize: 10.5, lineHeight: 1.65, color: "var(--text-mid)" }}>
-                    <strong style={{ color: "var(--text)" }}>Anti-revert</strong> — simulasi
-                    tx dulu (eth_call). Kalau diperkirakan gagal, tx tidak dikirim
-                    dan gas tidak terbuang.
-                    <span style={{ color: "var(--text-dim)" }}>
-                      {" "}Matikan hanya kalau kamu sengaja mau memaksa kirim.
-                    </span>
+                  <span style={{ fontSize: 10.5, color: "var(--text-mid)" }}>
+                    <strong style={{ color: "var(--text)" }}>Anti-revert</strong>
+                    <span style={{ color: "var(--text-dim)" }}> — simulasi tx dulu</span>
                   </span>
                 </label>
 
@@ -1245,10 +1210,8 @@ function JobCreator({ wallets, chains, platform, onCreated }) {
                     }
                     style={{ ...input, width: 62, padding: "4px 7px", fontSize: 11 }}
                   />
-                  <span style={{ fontSize: 9.5, color: "var(--text-dim)", lineHeight: 1.5 }}>
-                    percobaan. Error sementara (RPC mati, rate limit, stage belum
-                    buka) diulang otomatis; error final (tidak eligible, sold out,
-                    saldo kurang) tidak.
+                  <span style={{ fontSize: 9.5, color: "var(--text-dim)" }}>
+                    percobaan
                   </span>
                 </div>
               </div>
@@ -1261,10 +1224,6 @@ function JobCreator({ wallets, chains, platform, onCreated }) {
                 {creating ? "MEMBUAT JOB…" : `JADWALKAN MINT — ${selected.length} wallet × ${amount}`}
               </button>
 
-              <p style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 9, lineHeight: 1.7 }}>
-                Job masuk antrean, worker di VPS yang mengeksekusi. Kamu tidak
-                perlu membuka halaman ini terus — mint jalan walau browser ditutup.
-              </p>
             </>
           )}
         </>
@@ -1303,46 +1262,21 @@ function PlatformComingSoon({ platform }) {
         </span>
       </div>
 
-      <p style={{ fontSize: 11, color: "var(--text-dim)", lineHeight: 1.8, marginBottom: 14 }}>
-        {platform.description}
-      </p>
 
-      <div
-        style={{
-          background: "var(--bg2)",
-          border: "1px solid var(--border)",
-          borderRadius: 4,
-          padding: "11px 13px",
-          fontSize: 10.5,
-          lineHeight: 1.85,
-          color: "var(--text-dim)",
-        }}
-      >
-        <div style={{ color: "var(--text-mid)", marginBottom: 6 }}>
-          Yang sudah siap dipakai bersama nanti:
+      {platform.pendingWork && (
+        <div
+          style={{
+            background: "var(--bg2)",
+            border: "1px solid var(--border)",
+            borderRadius: 4,
+            padding: "11px 13px",
+            fontSize: 10.5,
+            color: "var(--live)",
+          }}
+        >
+          Perlu dibangun: {platform.pendingWork}
         </div>
-        <div>· Wallet terenkripsi — sama, tidak perlu import ulang</div>
-        <div>· RPC per chain + fallback otomatis</div>
-        <div>· Anti-revert (simulasi sebelum kirim)</div>
-        <div>· Auto-retry dengan klasifikasi error</div>
-        <div>· Anti rate-limit (token bucket per host)</div>
-
-        {/* Deskripsi pekerjaan yang tersisa datang dari lib/platforms.js,
-            bukan hardcode di sini — supaya menambah platform cuma perlu
-            mengubah registry. */}
-        {platform.pendingWork && (
-          <div
-            style={{
-              marginTop: 8,
-              paddingTop: 8,
-              borderTop: "1px solid var(--border)",
-              color: "var(--live)",
-            }}
-          >
-            Yang masih perlu dibangun: {platform.pendingWork}
-          </div>
-        )}
-      </div>
+      )}
     </div>
   );
 }
@@ -1407,8 +1341,8 @@ function JobDetail({ jobId, onClose, onChanged, ask }) {
       message: `Batalkan job untuk ${job.slug}?`,
       detail:
         job.status === "CLAIMED"
-          ? "Worker sedang memproses job ini. Pembatalan berlaku sebelum tx dikirim; kalau tx sudah terkirim, ia tidak bisa ditarik kembali."
-          : "Job dikeluarkan dari antrean dan tidak akan dieksekusi.",
+          ? "Sedang diproses. Tx yang sudah terkirim tidak bisa ditarik."
+          : "Job dikeluarkan dari antrean.",
       confirmLabel: "batalkan job",
       danger: true,
     });
@@ -1756,10 +1690,6 @@ export default function AcoDashboard() {
             {wallets.length}/{walletLimit} wallet · {chains.length} chain · {activeCount} job aktif
           </span>
         </div>
-        <p style={{ fontSize: 11, color: "var(--text-dim)", marginTop: 4, lineHeight: 1.7 }}>
-          Anti-revert · auto-retry · anti rate-limit · RPC fallback. Worker di
-          VPS yang eksekusi, browser boleh ditutup.
-        </p>
       </div>
 
       {/* Tab platform. Wallet & RPC dipakai bersama semua platform, jadi
