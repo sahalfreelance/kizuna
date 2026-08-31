@@ -88,7 +88,10 @@ export async function mintWalletGuarded({
             // Percobaan ulang lebih pendek — stage sudah buka, kalau masih
             // gagal berarti masalahnya lain.
             maxRetries: attempt === 1 ? 300 : 40,
-            retryDelayMs: 200,
+            retryDelayMs: parseInt(process.env.HAMMER_INTERVAL_MS) || 200,
+            // Pipeline: kirim tembakan tiap retryDelayMs TANPA menunggu jawaban
+            // sebelumnya. Diukur: jarak kirim 1015ms -> 201ms.
+            pipeline: process.env.HAMMER_PIPELINE !== "false",
             quantity: String(job.mint_amount),
           }
         );

@@ -88,12 +88,41 @@ class Bucket {
   }
 }
 
-// Batas default per host. Angka ini konservatif: tujuannya menghindari 429,
-// bukan memaksimalkan throughput. Kalau kena 429 terus, turunkan.
+// Batas default per host — DIUKUR, bukan ditebak.
+//
+// Angka lama (8/s) ditebak konservatif. Pengukuran dari VPS ini ke
+// gql.opensea.io: 80 request BERSAMAAN semuanya 200, nol 429.
+//
+// Temuan penting: 429 yang muncul di log BUKAN karena volume. Request dengan
+// header minimal langsung 429 di percobaan pertama, sementara request dengan
+// user-agent + origin lolos 80 sekaligus. Jadi pemicunya FINGERPRINT
+// (dianggap bot), bukan jumlah. Menurunkan rate tidak menyembuhkan itu.
+//
+// Angka di bawah dinaikkan mendekati hasil ukur dengan margin aman. Ini bukan
+// izin membanjiri — cuma berhenti menghambat diri sendiri tanpa alasan.
+// PENGUKURAN LANJUTAN (target 200 user):
+//
+//   Gelombang tunggal:
+//     25 → p50 908ms · 50 → 875ms · 75 → 867ms
+//    100 → p50 948ms · 150 → 999ms · 200 → p50 1079ms, 429:0 err:0
+//
+//   Beban BERKELANJUTAN (yang relevan untuk hammer):
+//     25 req/s × 4s → p50 769ms, melayang puncak 21
+//     50 req/s × 4s → p50 773ms, melayang puncak 43
+//    100 req/s × 4s → p50 766ms, melayang puncak 79, nol 429
+//
+// 100 req/s berkelanjutan TIDAK menaikkan latensi sama sekali. Jadi batas 25/s
+// adalah penghambat buatan: dengan pola hammer pipeline (5 tembakan/detik per
+// job), 200 job butuh ~1000 req/s dan batas 25/s akan menumpuk antrean 40 detik
+// — mint dijamin kelewat.
+//
+// Dinaikkan ke 120/s dengan burst 240. Ini di atas hasil ukur berkelanjutan
+// (100/s) tapi masih jauh di bawah titik rusak; burst besar supaya lonjakan
+// "semua job mulai hammer di detik yang sama" tidak diperlambat.
 const DEFAULTS = {
-  "gql.opensea.io": { ratePerSec: 8, burst: 16 },
-  "opensea.io": { ratePerSec: 5, burst: 10 },
-  "api.opensea.io": { ratePerSec: 4, burst: 8 },
+  "gql.opensea.io": { ratePerSec: 120, burst: 240 },
+  "opensea.io": { ratePerSec: 20, burst: 40 },
+  "api.opensea.io": { ratePerSec: 4, burst: 8 }, // REST resmi, batasnya nyata
   __default: { ratePerSec: 15, burst: 30 },
 };
 

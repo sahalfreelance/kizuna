@@ -11,6 +11,7 @@ import { statsSnapshot } from "./lib/rateLimiter.js";
 import { mintWalletGuarded } from "./lib/mintGuarded.js";
 import { drainEligibilityQueue } from "./lib/eligWorker.js";
 import { withWalletLock } from "./lib/walletLock.js";
+import { Semaphore } from "./lib/semaphore.js";
 import { getSiweSession } from "./lib/siweSession.js";
 import { fetchDropInfo } from "./lib/graphql.js";
 
@@ -39,16 +40,42 @@ const CONFIG = {
   // Alasannya user menunggu di depan layar: kalau ikut polling 5 detik, hasil
   // yang komputasinya cuma ~1 detik jadi terasa 6 detik.
   ELIG_POLL_MS: parseInt(process.env.ELIG_POLL_MS) || 700,
-  // Berapa job mint yang boleh jalan BERSAMAAN.
+  // Berapa job yang boleh AKTIF bersamaan. 0 = TANPA BATAS (default).
   //
-  // Dulu job diproses satu per satu. Karena processJob menunggu window mint
-  // (bisa berjam-jam), job lain tertahan di QUEUED sampai kelewat — job dengan
-  // jadwal lebih awal bisa kalah dari job yang diambil lebih dulu.
+  // Kenapa tanpa batas: job ACO hidupnya bisa berjam-jam, tapi 99% waktunya
+  // cuma MENUNGGU window — tidur, sesekali cek pembatalan. Beban nyatanya
+  // hampir nol. Kalau dibatasi di level job, slot tertahan berjam-jam dan user
+  // ke-9 harus menunggu job ke-1 SELESAI, bukan cuma menunggu bebannya lewat.
   //
-  // 8 dipilih karena beban tiap job kecil saat menunggu (cek pembatalan tiap
-  // beberapa detik). Yang benar-benar padat cuma detik-detik mint, dan itu
-  // sudah dijaga rate limiter per-host.
-  MAX_CONCURRENT_JOBS: parseInt(process.env.MAX_CONCURRENT_JOBS) || 8,
+  // Yang benar-benar perlu dibatasi cuma FASE MINT (beberapa detik), dan itu
+  // dijaga MAX_CONCURRENT_MINTS di bawah.
+  //
+  // Set angka > 0 hanya kalau VPS-nya benar-benar kecil dan lu mau pagar keras.
+  MAX_CONCURRENT_JOBS: parseInt(process.env.MAX_CONCURRENT_JOBS) || 0,
+
+  // Berapa job yang boleh berada di FASE MINT bersamaan.
+  //
+  // Ini pembatasan yang benar: cuma berlaku di detik-detik padat (hammer
+  // calldata, preflight, kirim tx). Job yang menunggu window TIDAK memakai slot,
+  // jadi 20 user bisa punya job aktif semua tanpa saling menahan.
+  //
+  // DIUKUR di VPS 2 vCPU / 2GB untuk target 200 user bersamaan:
+  //
+  //   200 job hammer PIPELINE bersamaan (800 request, 800 melayang serentak)
+  //     → 795× 200, NOL 429, 5 error jaringan, RSS puncak 210 MB
+  //     → TAPI p50 melonjak 780ms → 3641ms (4.7×) karena 800 request
+  //       melayang berebut 1 event loop
+  //
+  //   Gelombang terkendali: 200 bersamaan → p50 1079ms, 429:0, err:0
+  //   Berkelanjutan 100 req/s × 4s → p50 766ms, melayang puncak 79, 429:0
+  //
+  // Kesimpulan: OpenSea sanggup, yang tidak sanggup itu 800 request melayang
+  // tanpa pembatas. 200 job boleh HIDUP bersamaan (job menunggu window ~0 beban),
+  // tapi fase mint dibatasi 200 supaya request melayang tidak meledak.
+  //
+  // 200 = target user. Kalau nanti > 200 user aktif serentak, naikkan bertahap
+  // dan pantau p50 di log — begitu p50 lewat ~1500ms, itu tanda kelebihan.
+  MAX_CONCURRENT_MINTS: parseInt(process.env.MAX_CONCURRENT_MINTS) || 200,
   // Seberapa sering job hidup memperbarui penanda hidupnya.
   HEARTBEAT_MS: parseInt(process.env.HEARTBEAT_MS) || 30000,
   WORKER_ID: process.env.WORKER_ID || `worker-${process.pid}`,
@@ -59,7 +86,7 @@ const CONFIG = {
 // masih OPEN mint tetap bisa dieksekusi. Sekarang yang menentukan adalah waktu
 // TUTUP stage. Kalau env MAX_LATE_MS masih ada di .env, diabaikan saja.
 
-const WORKER_VERSION = "v6";
+const WORKER_VERSION = "v10";
 
 // SIWE login memakan ~2 detik per wallet. Untuk mint yang menang-kalahnya
 // hitungan detik, itu mahal. Session dipanaskan lebih awal: dimulai
@@ -131,6 +158,15 @@ async function claimNextJob() {
 }
 
 let claimFallbackWarned = false;
+
+/**
+ * Pembatas FASE MINT (bukan pembatas job).
+ *
+ * Job yang menunggu window tidak memakai slot ini, jadi jumlah user yang bisa
+ * punya job aktif bersamaan tidak dibatasi. Yang dijaga cuma lonjakan request
+ * saat beberapa stage buka berbarengan.
+ */
+const mintSemaphore = new Semaphore(CONFIG.MAX_CONCURRENT_MINTS, { name: "mint" });
 
 /** Cara lama — dipakai hanya kalau migration paralel belum dijalankan. */
 async function claimNextJobLegacy() {
@@ -674,31 +710,50 @@ async function processJob(job) {
     }
 
     // ---- 7. Mint semua wallet paralel -----------------------------------
+    //
+    // Hanya BAGIAN INI yang dibatasi konkurensinya, bukan seluruh job.
+    //
+    // Alasannya: job yang menunggu window tidak membebani apa pun. Yang bikin
+    // padat cuma detik-detik ini — hammer calldata ke OpenSea, preflight, kirim
+    // tx. Membatasi di sini menjaga rate limit tanpa membuat user mengantre
+    // berjam-jam.
     await setJobStatus(job.id, { status: "RUNNING" });
-    await log.info(
-      `Mint dengan ${sessions.length} wallet (paralel) · ` +
-        `maks ${job.max_attempts || 3} percobaan/wallet · ` +
-        `anti-revert ${job.abort_on_revert === false ? "OFF" : "ON"}`
-    );
 
-    const startTimeMs = new Date(startTimeISO).getTime();
+    const mintPhase = async ({ waitedMs }) => {
+      if (waitedMs > 50) {
+        await log.info(
+          `Mulai mint setelah menunggu slot ${(waitedMs / 1000).toFixed(1)}s ` +
+            `(${CONFIG.MAX_CONCURRENT_MINTS} mint berjalan bersamaan)`
+        );
+      }
 
-    const settled = await Promise.allSettled(
-      sessions.map((session) =>
-        mintWalletGuarded({
-          supabase,
-          session,
-          job,
-          pool,
-          contractAddress,
-          chain,
-          startTs,
-          startTimeMs,
-          apiKey,
-          log,
-        })
-      )
-    );
+      await log.info(
+        `Mint dengan ${sessions.length} wallet (paralel) · ` +
+          `maks ${job.max_attempts || 3} percobaan/wallet · ` +
+          `anti-revert ${job.abort_on_revert === false ? "OFF" : "ON"}`
+      );
+
+      const startTimeMs = new Date(startTimeISO).getTime();
+
+      return Promise.allSettled(
+        sessions.map((session) =>
+          mintWalletGuarded({
+            supabase,
+            session,
+            job,
+            pool,
+            contractAddress,
+            chain,
+            startTs,
+            startTimeMs,
+            apiKey,
+            log,
+          })
+        )
+      );
+    };
+
+    const settled = await mintSemaphore.run(mintPhase);
 
     const results = settled.map((r) =>
       r.status === "fulfilled"
@@ -885,7 +940,11 @@ async function main() {
     console.log("    pembersihan job mati DILEWATI (demi keamanan).");
     console.log("    Jalankan supabase/migration_aco_parallel.sql.");
   } else {
-    console.log(`  ✓ Job paralel siap (maks ${CONFIG.MAX_CONCURRENT_JOBS} bersamaan)`);
+    console.log(
+      `  ✓ Job paralel siap (job aktif: ${
+        CONFIG.MAX_CONCURRENT_JOBS > 0 ? `maks ${CONFIG.MAX_CONCURRENT_JOBS}` : "tanpa batas"
+      })`
+    );
   }
 
   if (checkOnly) {
@@ -896,7 +955,12 @@ async function main() {
   }
 
   console.log(`  worker id : ${CONFIG.WORKER_ID}`);
-  console.log(`  paralel   : maks ${CONFIG.MAX_CONCURRENT_JOBS} job bersamaan`);
+  console.log(
+    `  job aktif : ${
+      CONFIG.MAX_CONCURRENT_JOBS > 0 ? `maks ${CONFIG.MAX_CONCURRENT_JOBS}` : "tanpa batas"
+    }`
+  );
+  console.log(`  fase mint : maks ${CONFIG.MAX_CONCURRENT_MINTS} bersamaan`);
   console.log(`  heartbeat : tiap ${CONFIG.HEARTBEAT_MS / 1000}s`);
   console.log("");
 
@@ -938,18 +1002,26 @@ async function main() {
         workerId: CONFIG.WORKER_ID,
       });
 
-      // Ambil job sebanyak slot yang tersisa, tidak cuma satu — kalau 3 job
-      // masuk sekaligus, ketiganya harus langsung jalan.
+      // Ambil SEMUA job yang mengantre, tidak cuma satu — kalau 20 user bikin
+      // job sekaligus, ke-20-nya langsung aktif.
+      //
+      // MAX_CONCURRENT_JOBS default 0 = tanpa batas. Yang dibatasi cuma fase
+      // mint (mintSemaphore), karena job yang menunggu window tidak membebani.
       let claimedNow = 0;
-      while (running.size < CONFIG.MAX_CONCURRENT_JOBS) {
+      const jobCap = CONFIG.MAX_CONCURRENT_JOBS > 0 ? CONFIG.MAX_CONCURRENT_JOBS : Infinity;
+
+      while (running.size < jobCap) {
         const job = await claimNextJob();
         if (!job) break;
 
         startJob(job);
         claimedNow++;
+
+        const sem = mintSemaphore.stats();
         console.log(
           `  [${ts()}] job ${job.id.slice(0, 8)} (${job.slug}) mulai · ` +
-            `${running.size}/${CONFIG.MAX_CONCURRENT_JOBS} slot terpakai`
+            `${running.size} job aktif · mint ${sem.active}/${sem.max}` +
+            (sem.waiting > 0 ? ` (+${sem.waiting} nunggu slot mint)` : "")
         );
       }
 
@@ -966,9 +1038,13 @@ async function main() {
         idleTicks++;
         // Heartbeat tiap ~5 menit biar kelihatan worker masih hidup di pm2 logs
         if (idleTicks % Math.max(1, Math.floor(300000 / CONFIG.ELIG_POLL_MS)) === 0) {
+          const sem = mintSemaphore.stats();
           console.log(
-            `  [${ts()}] idle · ${running.size} job jalan` +
-              (running.size > 0 ? " (menunggu window)" : "")
+            `  [${ts()}] idle · ${running.size} job aktif` +
+              (running.size > 0 ? " (menunggu window)" : "") +
+              (sem.active > 0 || sem.waiting > 0
+                ? ` · mint ${sem.active}/${sem.max}, ${sem.waiting} nunggu`
+                : "")
           );
           await releaseStuckJobs();
           // Bersihkan hasil check basi + session SIWE kedaluwarsa. Hasil check

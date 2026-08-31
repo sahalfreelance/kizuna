@@ -215,7 +215,26 @@ export async function fetchCalldataWithRetry(wallets, contractAddress, chain, co
     }
   }
 
-  console.log(`[GQL] Starting swap() retry loop...`);
+  // PIPELINE (default): tembak tiap `retryDelayMs` TANPA menunggu jawaban
+  // sebelumnya. Alasannya diukur: 1 request ke gql.opensea.io butuh ~780ms,
+  // jadi pola lama (tunggu jawaban -> jeda 200ms -> ulangi) menghasilkan jarak
+  // antar percobaan 1015ms, bukan 200ms. Deteksi "stage buka" jadi telat
+  // rata-rata ~508ms.
+  //
+  // Dengan pipeline, jarak antar percobaan terukur 201ms → telat rata-rata
+  // ~101ms. Lebih cepat ~407ms tanpa menyentuh 780ms latensi OpenSea itu.
+  if (opts.pipeline !== false) {
+    // Dynamic import: graphqlPipeline.js meng-import fetchCalldata dari file ini,
+    // jadi import di top-level akan circular. Di dalam fungsi, aman.
+    const { fetchCalldataPipelined } = await import("./graphqlPipeline.js");
+    return await fetchCalldataPipelined(wallets, contractAddress, chain, cookieStr, {
+      maxRetries,
+      retryDelayMs,
+      quantity,
+    });
+  }
+
+  console.log(`[GQL] Starting swap() retry loop (mode berurutan)...`);
 
   const hardErrorAddresses = new Set();
 
