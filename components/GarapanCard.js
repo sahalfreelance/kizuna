@@ -1,6 +1,5 @@
 "use client";
 
-import { useState } from "react";
 import { getEffectiveStatus } from "@/lib/raffleStatus";
 
 const CATEGORY_COLOR = {
@@ -15,50 +14,12 @@ const CATEGORY_LABEL = {
   CRYPTO:  "CRYPTO",
 };
 
-const URL_REGEX = /(https?:\/\/[^\s]+)/g;
-
-// Ubah URL polos di dalam teks deskripsi jadi link yang bisa diklik,
-// dengan gaya font beda (mono + warna aksen) biar kebedain dari teks biasa.
-function linkifyDescription(text) {
-  const parts = text.split(URL_REGEX);
-  return parts.map((part, i) =>
-    part.startsWith("http://") || part.startsWith("https://") ? (
-      <a
-        key={i}
-        href={part}
-        target="_blank"
-        rel="noreferrer"
-        onClick={(e) => e.stopPropagation()}
-        style={{
-          fontFamily: "var(--font-mono)",
-          color: "var(--indigo-hi)",
-          textDecoration: "underline",
-          wordBreak: "break-all",
-        }}
-      >
-        {part}
-      </a>
-    ) : (
-      <span key={i}>{part}</span>
-    )
-  );
-}
-
 export default function GarapanCard({ entry, index = 0 }) {
-  const [expanded, setExpanded] = useState(false);
   const color = CATEGORY_COLOR[entry.category] || "var(--text-dim)";
   const date = new Date(entry.created_at).toLocaleDateString("id-ID", {
     day: "2-digit", month: "short", year: "numeric",
   });
   const isLive = entry.category === "RAFFLE" && getEffectiveStatus(entry) === "LIVE";
-
-  const description = entry.description || "";
-  const lineCount = description.split("\n").filter(Boolean).length;
-  const isLong = lineCount > 5 || description.length > 260;
-  // Selama belum di-expand DAN teksnya panjang, tombol bawah dipakai buat
-  // "lihat selengkapnya" dulu. Begitu di-expand (atau teksnya emang pendek),
-  // tombol itu berubah jadi link asli ke pesan Discord / sumbernya.
-  const showExpandButton = isLong && !expanded;
 
   return (
     <div
@@ -73,6 +34,9 @@ export default function GarapanCard({ entry, index = 0 }) {
         display: "flex",
         flexDirection: "column",
         gap: 10,
+        // height 100% + marginTop:auto di blok meta = tombol semua card rata bawah,
+        // tanpa perlu ukur tinggi di JS.
+        height: "100%",
         position: "relative",
         transition: "border-color 0.15s, background 0.15s",
       }}
@@ -124,52 +88,9 @@ export default function GarapanCard({ entry, index = 0 }) {
         {entry.title}
       </div>
 
-      {/* desc: line break asli dipertahankan, dipotong biar card gak kepanjangan */}
-      {entry.description && (
-        <>
-          <p
-            style={{
-              fontSize: 12,
-              color: "var(--text-mid)",
-              lineHeight: 1.6,
-              margin: 0,
-              whiteSpace: "pre-line",
-              ...(showExpandButton
-                ? {
-                    display: "-webkit-box",
-                    WebkitLineClamp: 5,
-                    WebkitBoxOrient: "vertical",
-                    overflow: "hidden",
-                  }
-                : {}),
-            }}
-          >
-            {linkifyDescription(entry.description)}
-          </p>
-          {isLong && expanded && (
-            <button
-              onClick={() => setExpanded(false)}
-              style={{
-                alignSelf: "flex-start",
-                fontSize: 11,
-                color: "var(--text-dim)",
-                background: "transparent",
-                border: "none",
-                padding: 0,
-                cursor: "pointer",
-                letterSpacing: 0.5,
-              }}
-              onMouseEnter={e => e.currentTarget.style.color = "var(--text-mid)"}
-              onMouseLeave={e => e.currentTarget.style.color = "var(--text-dim)"}
-            >
-              ▴ tampilkan lebih sedikit
-            </button>
-          )}
-        </>
-      )}
-
-      {/* meta */}
+      {/* meta — marginTop:auto mendorong meta + tombol ke dasar card */}
       <div style={{
+        marginTop: "auto",
         fontSize: 11,
         color: "var(--text-dim)",
         borderTop: "1px solid var(--border)",
@@ -182,53 +103,28 @@ export default function GarapanCard({ entry, index = 0 }) {
         <span>{date}</span>
       </div>
 
-      {/* tombol bawah: "lihat selengkapnya" dulu kalau teksnya panjang,
-          abis di-expand baru berubah jadi link beneran ke sumbernya */}
-      {showExpandButton ? (
-        <button
-          onClick={() => setExpanded(true)}
+      {entry.link && (
+        <a
+          href={entry.link}
+          target="_blank"
+          rel="noreferrer"
           style={{
             fontSize: 12,
-            color: "var(--text-mid)",
-            background: "transparent",
-            border: "1px solid var(--border)",
+            color: "var(--bg)",
+            background: color,
+            border: "none",
             borderRadius: 4,
             padding: "7px 12px",
             textAlign: "center",
             letterSpacing: 0.5,
             fontWeight: 600,
-            cursor: "pointer",
-            transition: "border-color 0.15s, color 0.15s",
+            transition: "opacity 0.15s",
           }}
-          onMouseEnter={e => { e.currentTarget.style.borderColor = color.replace("var(", "").replace(")", ""); e.currentTarget.style.color = "var(--text)"; }}
-          onMouseLeave={e => { e.currentTarget.style.borderColor = "var(--border)"; e.currentTarget.style.color = "var(--text-mid)"; }}
+          onMouseEnter={e => e.currentTarget.style.opacity = "0.8"}
+          onMouseLeave={e => e.currentTarget.style.opacity = "1"}
         >
-          lihat selengkapnya ▾
-        </button>
-      ) : (
-        entry.link && (
-          <a
-            href={entry.link}
-            target="_blank"
-            rel="noreferrer"
-            style={{
-              fontSize: 12,
-              color: "var(--bg)",
-              background: color,
-              border: "none",
-              borderRadius: 4,
-              padding: "7px 12px",
-              textAlign: "center",
-              letterSpacing: 0.5,
-              fontWeight: 600,
-              transition: "opacity 0.15s",
-            }}
-            onMouseEnter={e => e.currentTarget.style.opacity = "0.8"}
-            onMouseLeave={e => e.currentTarget.style.opacity = "1"}
-          >
-            ./open_link.sh →
-          </a>
-        )
+          ./open_link.sh →
+        </a>
       )}
     </div>
   );

@@ -95,7 +95,7 @@ export default function Dashboard({ entries: initialEntries }) {
             </div>
             <h1 style={{ fontSize: 22, fontWeight: 700, color: "var(--text)", letterSpacing: 0.5 }}
               className="cursor">
-              Rangkuman garapan komunitas
+              Welcome To Kizuna
             </h1>
             <div style={{ fontSize: 12, color: "var(--text-dim)", marginTop: 6 }}>
               {entries.length} entries found &nbsp;·&nbsp; sorted by latest
