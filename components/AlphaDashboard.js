@@ -39,18 +39,6 @@ const SECTIONS = [
 
 const POLL_INTERVAL_MS = 20000;
 
-// Polling minta PER SECTION, bukan sekali ambil semua.
-//
-// Bug sebelumnya: muatan awal halaman pakai limit 300 (semua data), tapi
-// polling pakai limit=100 lalu MENIMPA seluruh state. Data diurut
-// source_timestamp DESC, dan item TRENDING (profil project) timestamp-nya
-// lebih tua daripada tweet/launch yang masuk terus -- jadi TRENDING
-// kepotong habis dari 100 teratas dan tab-nya jadi kosong setelah 20 detik.
-//
-// Per-section bikin tiap section punya kuota sendiri, jadi nggak bisa saling
-// menggusur, dan tetap aman walau data tumbuh jadi ribuan.
-const POLL_LIMIT_PER_SECTION = 150;
-
 export default function AlphaDashboard({ items: initialItems }) {
   const [items, setItems] = useState(initialItems);
   const [section, setSection] = useState("TRENDING");
@@ -74,34 +62,21 @@ export default function AlphaDashboard({ items: initialItems }) {
 
       setIsSyncing(true);
       try {
-        // Satu request per section supaya section yang timestamp-nya tua
-        // (TRENDING) nggak tergusur oleh section yang datanya sering masuk.
-        const results = await Promise.all(
-          SECTIONS.map((s) =>
-            fetch(
-              `/api/alpha?section=${s.key}&limit=${POLL_LIMIT_PER_SECTION}`,
-              { cache: "no-store" }
-            )
-              .then((res) => (res.ok ? res.json() : null))
-              .catch(() => null)
-          )
-        );
+        // Tanpa parameter section: server mengembalikan kuota per section,
+        // jadi TRENDING tidak bisa digusur FEED.
+        const res = await fetch("/api/alpha?limit=100", { cache: "no-store" });
+        if (!res.ok) return;
 
-        if (cancelled) return;
+        const json = await res.json();
+        if (cancelled || !json.data) return;
 
-        // Kalau ADA section yang gagal, jangan timpa state — lebih baik
-        // pakai data lama daripada menampilkan section kosong palsu.
-        if (results.some((r) => !r || !Array.isArray(r.data))) return;
-
-        const merged = results.flatMap((r) => r.data);
-
-        const fresh = merged.filter((i) => !seenRef.current.has(i.id));
+        const fresh = json.data.filter((i) => !seenRef.current.has(i.id));
         if (fresh.length > 0) setNewCount((c) => c + fresh.length);
-        merged.forEach((i) => seenRef.current.add(i.id));
+        json.data.forEach((i) => seenRef.current.add(i.id));
 
-        if (JSON.stringify(merged) !== JSON.stringify(itemsRef.current)) {
-          itemsRef.current = merged;
-          setItems(merged);
+        if (JSON.stringify(json.data) !== JSON.stringify(itemsRef.current)) {
+          itemsRef.current = json.data;
+          setItems(json.data);
         }
       } catch {
         // diem-diem aja, coba lagi siklus berikutnya
@@ -109,6 +84,10 @@ export default function AlphaDashboard({ items: initialItems }) {
         if (!cancelled) setIsSyncing(false);
       }
     }
+
+    // Poll sekali langsung: kalau data server-render sudah usang (atau section
+    // aktif kosong), user tidak perlu nunggu 20 detik dulu.
+    poll();
 
     const interval = setInterval(poll, POLL_INTERVAL_MS);
     document.addEventListener("visibilitychange", poll);
@@ -300,10 +279,11 @@ export default function AlphaDashboard({ items: initialItems }) {
             fontSize: 12,
           }}
         >
-          <p>belum ada data di section ini.</p>
-          <p style={{ marginTop: 6, fontSize: 11, opacity: 0.7 }}>
-            jalanin forwarder alphagate dulu, nanti muncul otomatis di sini.
-          </p>
+          {isSyncing ? (
+            <p className="cursor">memuat…</p>
+          ) : (
+            <p>belum ada data di section ini.</p>
+          )}
         </div>
       ) : (
         <div

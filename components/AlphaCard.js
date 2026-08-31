@@ -1,7 +1,5 @@
 "use client";
 
-import { useState } from "react";
-
 const CATEGORY_COLOR = {
   NFT: "var(--nft)",
   CRYPTO: "var(--crypto)",
@@ -64,12 +62,8 @@ function timeAgo(value) {
 }
 
 export default function AlphaCard({ item, index = 0 }) {
-  const [expanded, setExpanded] = useState(false);
-
   const color = CATEGORY_COLOR[item.category] || "var(--text-dim)";
   const description = item.description || "";
-  const isLong = description.length > 260 || description.split("\n").length > 6;
-  const showExpand = isLong && !expanded;
 
   const growth = [
     ["1d", item.key_followers_growth_1d],
@@ -95,6 +89,9 @@ export default function AlphaCard({ item, index = 0 }) {
         display: "flex",
         flexDirection: "column",
         gap: 9,
+        // height 100% + marginTop:auto di blok aksi = tombol semua card rata
+        // bawah, sama seperti GarapanCard. Tanpa ukur tinggi di JS.
+        height: "100%",
       }}
     >
       {/* header: badge sumber + kategori + waktu */}
@@ -195,7 +192,8 @@ export default function AlphaCard({ item, index = 0 }) {
         {item.title}
       </div>
 
-      {/* deskripsi */}
+      {/* deskripsi — dipotong 3 baris, tanpa tombol expand: tinggi card
+          seragam dan tombol tetap rata bawah. Teks penuh ada di link. */}
       {description && (
         <>
           <p
@@ -205,34 +203,14 @@ export default function AlphaCard({ item, index = 0 }) {
               lineHeight: 1.6,
               margin: 0,
               whiteSpace: "pre-line",
-              ...(showExpand
-                ? {
-                    display: "-webkit-box",
-                    WebkitLineClamp: 6,
-                    WebkitBoxOrient: "vertical",
-                    overflow: "hidden",
-                  }
-                : {}),
+              display: "-webkit-box",
+              WebkitLineClamp: 3,
+              WebkitBoxOrient: "vertical",
+              overflow: "hidden",
             }}
           >
             {linkify(description)}
           </p>
-          {isLong && (
-            <button
-              onClick={() => setExpanded(!expanded)}
-              style={{
-                alignSelf: "flex-start",
-                fontSize: 10.5,
-                color: "var(--text-dim)",
-                background: "transparent",
-                border: "none",
-                padding: 0,
-                cursor: "pointer",
-              }}
-            >
-              {expanded ? "▴ lebih sedikit" : "▾ selengkapnya"}
-            </button>
-          )}
         </>
       )}
 
@@ -320,7 +298,7 @@ export default function AlphaCard({ item, index = 0 }) {
       )}
 
       {/* aksi */}
-      <div style={{ display: "flex", gap: 6, marginTop: 2 }}>
+      <div style={{ display: "flex", gap: 6, marginTop: "auto", paddingTop: 2 }}>
         {item.link && (
           <a
             href={item.link}

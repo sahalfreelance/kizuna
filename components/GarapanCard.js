@@ -14,6 +14,33 @@ const CATEGORY_LABEL = {
   CRYPTO:  "CRYPTO",
 };
 
+const URL_REGEX = /(https?:\/\/[^\s]+)/g;
+
+// URL polos di deskripsi jadi link yang bisa diklik.
+function linkify(text) {
+  return text.split(URL_REGEX).map((part, i) =>
+    part.startsWith("http://") || part.startsWith("https://") ? (
+      <a
+        key={i}
+        href={part}
+        target="_blank"
+        rel="noreferrer"
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          fontFamily: "var(--font-mono)",
+          color: "var(--indigo-hi)",
+          textDecoration: "underline",
+          wordBreak: "break-all",
+        }}
+      >
+        {part}
+      </a>
+    ) : (
+      <span key={i}>{part}</span>
+    )
+  );
+}
+
 export default function GarapanCard({ entry, index = 0 }) {
   const color = CATEGORY_COLOR[entry.category] || "var(--text-dim)";
   const date = new Date(entry.created_at).toLocaleDateString("id-ID", {
@@ -87,6 +114,24 @@ export default function GarapanCard({ entry, index = 0 }) {
         <span style={{ color: "var(--indigo-dim)", marginRight: 6 }}>&gt;</span>
         {entry.title}
       </div>
+
+      {/* deskripsi — dipotong 3 baris pakai line-clamp, tanpa tombol expand.
+          Tinggi jadi seragam antar card dan tombol tetap rata bawah. */}
+      {entry.description && (
+        <p style={{
+          fontSize: 11.5,
+          color: "var(--text-mid)",
+          lineHeight: 1.6,
+          margin: 0,
+          whiteSpace: "pre-line",
+          display: "-webkit-box",
+          WebkitLineClamp: 3,
+          WebkitBoxOrient: "vertical",
+          overflow: "hidden",
+        }}>
+          {linkify(entry.description)}
+        </p>
+      )}
 
       {/* meta — marginTop:auto mendorong meta + tombol ke dasar card */}
       <div style={{

@@ -1,5 +1,5 @@
 import { getPageSession } from "@/lib/pageSession";
-import { supabaseAdmin } from "@/lib/supabase";
+import { fetchAlphaBySection } from "@/lib/alphaQuery";
 import Navbar from "@/components/Navbar";
 import AlphaDashboard from "@/components/AlphaDashboard";
 
@@ -8,23 +8,13 @@ export const dynamic = "force-dynamic";
 export default async function AlphaPage() {
   const session = getPageSession();
 
-  const { data, error } = await supabaseAdmin
-    .from("alpha_items")
-    .select("*")
-    // source_timestamp = waktu asli dari Alphagate, bukan waktu insert.
-    // nullsFirst:false biar data lama tanpa timestamp nggak nongkrong di atas.
-    .order("source_timestamp", { ascending: false, nullsFirst: false })
-    .order("created_at", { ascending: false })
-    .limit(300);
-
-  if (error) {
-    console.error("Gagal ambil data alpha:", error.message);
-  }
+  // Kuota per section: TRENDING tidak bisa digusur FEED yang volumenya tinggi.
+  const items = await fetchAlphaBySection(100);
 
   return (
     <>
       <Navbar session={session} />
-      <AlphaDashboard items={data || []} />
+      <AlphaDashboard items={items} />
     </>
   );
 }

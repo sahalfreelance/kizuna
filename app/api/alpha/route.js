@@ -1,12 +1,10 @@
 import { NextResponse } from "next/server";
 import { getAuthContext, buildDenial } from "@/lib/apiAuth";
 import { supabaseAdmin } from "@/lib/supabase";
+import { fetchAlphaBySection } from "@/lib/alphaQuery";
 
 const VALID_SECTIONS = ["TRENDING", "NEWS", "FEED"];
-// Naik dari 100. Halaman /alpha memuat awal dengan limit 300, jadi batas 100
-// di sini bikin polling mengembalikan lebih sedikit data daripada muatan
-// awal -- section yang timestamp-nya paling tua (TRENDING) kepotong habis.
-const MAX_LIMIT = 500;
+const MAX_LIMIT = 100;
 
 // Dipakai halaman /alpha buat polling data (mirip /api/garapan).
 // Auth-nya sama: harus member Discord House of Kizuna.
@@ -23,6 +21,12 @@ export async function GET(req) {
 
   const rawLimit = parseInt(searchParams.get("limit") || "60", 10);
   const limit = Number.isNaN(rawLimit) ? 60 : Math.min(Math.max(rawLimit, 1), MAX_LIMIT);
+
+  // Tanpa filter section (dipakai polling halaman /alpha): ambil per section
+  // supaya TRENDING tidak digusur FEED yang volumenya jauh lebih tinggi.
+  if (!section && !source && !category) {
+    return NextResponse.json({ data: await fetchAlphaBySection(limit) });
+  }
 
   let query = supabaseAdmin
     .from("alpha_items")
