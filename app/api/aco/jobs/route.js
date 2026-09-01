@@ -76,7 +76,23 @@ export async function POST(req) {
     );
   }
 
-  const slug = String(body?.slug || "").trim().toLowerCase();
+  // Platform "contract" tidak punya slug — identitasnya alamat kontrak. Karena
+  // kolom `slug` NOT NULL di DB, alamatnya dipakai sebagai slug supaya tampilan
+  // riwayat job tetap punya label.
+  const contractAddress = String(body?.contract_address || "").trim();
+  const isContract = platform === "contract";
+
+  if (isContract && !/^0x[0-9a-fA-F]{40}$/.test(contractAddress)) {
+    return NextResponse.json(
+      { error: "Alamat kontrak wajib diisi dan harus 0x + 40 hex." },
+      { status: 400 }
+    );
+  }
+
+  const slug = isContract
+    ? contractAddress.toLowerCase()
+    : String(body?.slug || "").trim().toLowerCase();
+
   if (!slug) {
     return NextResponse.json({ error: "Slug collection wajib diisi." }, { status: 400 });
   }
@@ -159,7 +175,7 @@ export async function POST(req) {
       user_id: auth.userId,
       platform,
       slug,
-      contract_address: body?.contract_address || null,
+      contract_address: contractAddress || null,
       chain,
       chain_id: chainIdOf(chain),
       rpc_url: rpcRow?.encrypted_url || null,

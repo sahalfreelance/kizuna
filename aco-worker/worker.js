@@ -11,6 +11,7 @@ import { statsSnapshot } from "./lib/rateLimiter.js";
 import { mintWalletGuarded } from "./lib/mintGuarded.js";
 import { drainEligibilityQueue } from "./lib/eligWorker.js";
 import { withWalletLock } from "./lib/walletLock.js";
+import { runContractJob } from "./lib/contractJob.js";
 import { Semaphore } from "./lib/semaphore.js";
 import { getSiweSession } from "./lib/siweSession.js";
 import { fetchDropInfo } from "./lib/graphql.js";
@@ -79,6 +80,19 @@ const CONFIG = {
   // Seberapa sering job hidup memperbarui penanda hidupnya.
   HEARTBEAT_MS: parseInt(process.env.HEARTBEAT_MS) || 30000,
   WORKER_ID: process.env.WORKER_ID || `worker-${process.pid}`,
+  // Platform yang ditangani worker ini. Kosong = semua (perilaku lama, satu
+  // worker mengerjakan segalanya).
+  //
+  // Dipisah supaya job contract tidak berebut slot dengan job OpenSea: keduanya
+  // beda karakter beban. OpenSea = ratusan request HTTP ke satu host (rentan
+  // rate limit, event loop padat). Contract = eth_call ke RPC sendiri (jauh
+  // lebih ringan, tapi butuh hammer 200ms tanpa henti).
+  //
+  // Contoh: WORKER_PLATFORMS=contract
+  WORKER_PLATFORMS: (process.env.WORKER_PLATFORMS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
 };
 
 // CATATAN: MAX_LATE_MS sudah DIHAPUS. Dulu job digagalkan kalau waktu buka
@@ -86,7 +100,7 @@ const CONFIG = {
 // masih OPEN mint tetap bisa dieksekusi. Sekarang yang menentukan adalah waktu
 // TUTUP stage. Kalau env MAX_LATE_MS masih ada di .env, diabaikan saja.
 
-const WORKER_VERSION = "v10";
+const WORKER_VERSION = "v11";
 
 // SIWE login memakan ~2 detik per wallet. Untuk mint yang menang-kalahnya
 // hitungan detik, itu mahal. Session dipanaskan lebih awal: dimulai
@@ -133,11 +147,32 @@ async function claimNextJob() {
   //
   // Ini inti perbaikannya: job yang mau mint 10 menit lagi harus menang dari
   // job yang mau mint 6 jam lagi, walau dibuat belakangan.
+  //
+  // p_platforms menyaring per platform supaya worker contract dan worker
+  // OpenSea tidak berebut job yang bukan urusannya.
   const { data, error } = await supabase.rpc("aco_claim_job", {
     p_worker: CONFIG.WORKER_ID,
+    p_platforms: CONFIG.WORKER_PLATFORMS.length ? CONFIG.WORKER_PLATFORMS : null,
   });
 
   if (error) {
+    // Fungsi versi 2-parameter belum ada = migration_worker_split.sql belum
+    // dijalankan. Coba versi 1-parameter dulu sebelum menyerah ke cara lama.
+    if (
+      CONFIG.WORKER_PLATFORMS.length &&
+      /p_platforms|function aco_claim_job\(text, text\[\]\)/i.test(error.message)
+    ) {
+      if (!platformFilterWarned) {
+        platformFilterWarned = true;
+        console.warn(
+          "  [worker] aco_claim_job belum punya parameter p_platforms — " +
+            "penyaringan platform dilakukan DI WORKER (job platform lain " +
+            "dilepas kembali). Jalankan supabase/migration_worker_split.sql."
+        );
+      }
+      return claimNextJobUnfiltered();
+    }
+
     // Fungsi belum ada = migration_aco_parallel.sql belum dijalankan.
     // Jatuh ke cara lama supaya worker tetap bisa jalan, tapi beri tahu.
     if (String(error.message).includes("aco_claim_job")) {
@@ -158,6 +193,37 @@ async function claimNextJob() {
 }
 
 let claimFallbackWarned = false;
+let platformFilterWarned = false;
+
+/**
+ * Cadangan kalau migration_worker_split.sql belum dijalankan.
+ *
+ * Klaim tanpa saringan, lalu kalau platformnya bukan urusan worker ini, job
+ * DILEPAS kembali ke QUEUED. Bukan ideal — ada jeda klaim-lepas yang bisa
+ * membuat worker berputar sia-sia — tapi lebih baik daripada job dieksekusi
+ * worker yang salah.
+ */
+async function claimNextJobUnfiltered() {
+  const { data, error } = await supabase.rpc("aco_claim_job", {
+    p_worker: CONFIG.WORKER_ID,
+  });
+  if (error) {
+    console.error(`  [worker] gagal klaim: ${error.message}`);
+    return null;
+  }
+  const job = Array.isArray(data) ? (data[0] ?? null) : (data ?? null);
+  if (!job) return null;
+
+  const platform = job.platform || "opensea";
+  if (CONFIG.WORKER_PLATFORMS.length && !CONFIG.WORKER_PLATFORMS.includes(platform)) {
+    await supabase
+      .from("aco_jobs")
+      .update({ status: "QUEUED", claimed_by: null, claimed_at: null })
+      .eq("id", job.id);
+    return null;
+  }
+  return job;
+}
 
 /**
  * Pembatas FASE MINT (bukan pembatas job).
@@ -499,8 +565,11 @@ async function processJob(job) {
     // Key per user, bukan key bersama: rate limit pemakaian berlaku per key,
     // jadi kalau beberapa user mint bersamaan dengan key yang sama, request
     // saling berebut kuota dan sebagian gagal.
-    const apiKey = await getOpenseaApiKey(job.user_id);
-    if (!apiKey) {
+    // Platform "contract" tidak menyentuh API OpenSea sama sekali, jadi tidak
+    // boleh digagalkan gara-gara key tidak ada.
+    const isContract = job.platform === "contract";
+    const apiKey = isContract ? null : await getOpenseaApiKey(job.user_id);
+    if (!isContract && !apiKey) {
       throw new Error(
         "API key OpenSea tidak tersedia untuk user ini. Minta user login ulang " +
           "ke website, atau tekan refresh key di halaman /aco."
@@ -551,6 +620,21 @@ async function processJob(job) {
     }
 
     await log.info(`${wallets.length} wallet siap`);
+
+    // ---- 3b. Cabang platform "contract" ---------------------------------
+    // Mint langsung ke kontrak tidak lewat marketplace: tidak ada login SIWE,
+    // tidak ada API key, tidak ada refresh drop info. Jalurnya dipisah di
+    // lib/contractJob.js supaya alur OpenSea di bawah tetap utuh.
+    if (isContract) {
+      await runContractJob({
+        job,
+        wallets,
+        rpcUrl: pool.entries[0]?.url || rpcEntries[0]?.url,
+        log,
+        deps: { setJobStatus, isCancelled, waitForWindow, mintSemaphore },
+      });
+      return;
+    }
 
     // ---- 4. Login SIWE ---------------------------------------------------
     await log.info("Login ke OpenSea…");
@@ -961,6 +1045,11 @@ async function main() {
     }`
   );
   console.log(`  fase mint : maks ${CONFIG.MAX_CONCURRENT_MINTS} bersamaan`);
+  console.log(
+    `  platform  : ${
+      CONFIG.WORKER_PLATFORMS.length ? CONFIG.WORKER_PLATFORMS.join(", ") : "semua"
+    }`
+  );
   console.log(`  heartbeat : tiap ${CONFIG.HEARTBEAT_MS / 1000}s`);
   console.log("");
 

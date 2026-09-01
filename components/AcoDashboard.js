@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useConfirm } from "@/components/ConfirmDialog";
 import MintedItems from "@/components/MintedItems";
+import ContractJobCreator from "@/components/ContractJobCreator";
 import { explorerTxUrl } from "@/lib/chains";
 
 /* --------------------------------------------------------------- gaya dasar */
@@ -1762,6 +1763,12 @@ export default function AcoDashboard() {
               onClose={() => setOpenJob(null)}
               onChanged={loadJobs}
               ask={ask}
+            />
+          ) : activePlatform === "contract" ? (
+            <ContractJobCreator
+              wallets={wallets}
+              chains={chains}
+              onCreated={() => { loadJobs(); }}
             />
           ) : (
             <JobCreator
